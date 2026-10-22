@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="360dp"
+    android:height="160dp"
+    android:viewportWidth="360"
+    android:viewportHeight="160">
+    <path android:pathData="M0,0h360v160h-360z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="0"
+                android:startY="0"
+                android:endX="360"
+                android:endY="160"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#0B111E" />
+                <item android:offset="0.55" android:color="#0F292E" />
+                <item android:offset="1.0" android:color="#064E3B" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Subtle tech grid waves -->
+    <path
+        android:fillColor="#1A10B981"
+        android:pathData="M0,120 Q90,75 180,110 T360,80 L360,160 L0,160 Z" />
+    <path
+        android:fillColor="#2206B6D4"
+        android:pathData="M0,138 Q120,95 240,128 T360,105 L360,160 L0,160 Z" />
+    <!-- Glowing decorative nodes -->
+    <path
+        android:fillColor="#3310B981"
+        android:pathData="M295,45 m-36,0 a36,36 0 1,0 72,0 a36,36 0 1,0 -72,0" />
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M295,25 L313,33 L313,47 C313,59 305,69 295,73 C285,69 277,59 277,47 L277,33 Z" />
+    <path
+        android:fillColor="#0B111E"
+        android:pathData="M292,55 L286,49 L288.5,46.5 L292,50 L301.5,40.5 L304,43 Z" />
+</vector>

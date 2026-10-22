@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer Cyber Emerald Shield + Ledger Silhouette centered in 66dp safe zone -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M54,24 L78,34 L78,52 C78,68.5 67.8,82.8 54,88 C40.2,82.8 30,68.5 30,52 L30,34 L54,24 Z" />
+    <!-- Inner Dark Cutout for depth -->
+    <path
+        android:fillColor="#0B111E"
+        android:pathData="M54,30 L72,38 L72,52 C72,65 64.2,76.6 54,81.2 C43.8,76.6 36,65 36,52 L36,38 L54,30 Z" />
+    <!-- Ledger Lines & Verified Checkmark in Crisp White & Cyan -->
+    <path
+        android:fillColor="#06B6D4"
+        android:pathData="M43,43 H65 V47 H43 Z M43,51 H57 V55 H43 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M50.5,67.5 L44,61 L46.8,58.2 L50.5,61.9 L61.2,51.2 L64,54 L50.5,67.5 Z" />
+</vector>
