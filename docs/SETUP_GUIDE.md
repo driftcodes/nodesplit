@@ -124,7 +124,7 @@ These two files are private to your copy and are excluded by `.gitignore`, so th
 4. Quick check: open it in a text editor. Under `"oauth_client"` there must be at least one entry with `"client_type": 3`. If `oauth_client` is empty (`[]`), Google sign-in isn't enabled yet (Part 3.3) or no SHA was added (Part 6.2); fix that and download again.
 
 ### 4.2 `app/src/main/res/values/firebase_applet_config.xml`
-1. In `app/src/main/res/values/` copy `firebase_applet_config.xml.example` to `firebase_applet_config.xml` in the same folder. (In Android Studio switch the project panel to *Project* view, right-click the file → *Copy*, then right-click the folder → *Paste*, and name it `firebase_applet_config.xml`.)
+1. Copy `app/firebase_applet_config.xml.example` into the folder `app/src/main/res/values/` and name the copy `firebase_applet_config.xml`. (In Android Studio switch the project panel to *Project* view, right-click the example file → *Copy*, right-click the `values` folder → *Paste*, and type the new name.) The example must stay outside `res/values`: Android refuses to build if any file there doesn't end in `.xml`.
 2. Set the database ID from Part 3.4:
    ```xml
    <resources>
