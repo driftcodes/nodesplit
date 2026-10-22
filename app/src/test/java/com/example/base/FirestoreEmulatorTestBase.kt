@@ -87,7 +87,7 @@ abstract class FirestoreEmulatorTestBase {
      */
     protected suspend fun seedWorkspace(adminUid: String, costPerGbToman: Long = 1_000L) = withContext(Dispatchers.IO) {
         val url = URL(
-            "http://$EMULATOR_HOST:$FIRESTORE_PORT/v1/projects/$PROJECT_ID/databases/$databaseId/documents/config/workspace"
+            "http://$EMULATOR_HOST:$FIRESTORE_PORT/v1/projects/$PROJECT_ID/databases/$databaseId/documents/config?documentId=workspace"
         )
         val now = "2020-01-01T00:00:00Z"
         val body = """
@@ -103,13 +103,16 @@ abstract class FirestoreEmulatorTestBase {
             }}
         """.trimIndent()
         val connection = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "PATCH"
+            requestMethod = "POST"
             doOutput = true
             setRequestProperty("Authorization", "Bearer owner")
             setRequestProperty("Content-Type", "application/json")
         }
         connection.outputStream.use { it.write(body.toByteArray()) }
-        check(connection.responseCode in 200..299) { "Seeding workspace failed: ${connection.responseCode}" }
+        // 409 means it already exists from an earlier test in this run, which is fine.
+        check(connection.responseCode in 200..299 || connection.responseCode == 409) {
+            "Seeding workspace failed: ${connection.responseCode}"
+        }
         connection.disconnect()
     }
 

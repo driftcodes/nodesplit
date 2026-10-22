@@ -6,13 +6,15 @@ This round applies the Claude audit and the consolidated implementation brief. I
 
 | Check | Result |
 | --- | --- |
-| `firestore.test.js` against the Firestore emulator (firebase-tools 13) | **9/9 pass**: T01–T08 and a 500-sale archive/report test |
-| `FinancialRulesTest` (plain JUnit, JVM) | **12/12 pass**, including both screenshot fixtures |
-| Kotlin type-check of models, repository, ViewModel, PDF exporter | Compiles (against small Firebase/Android stand-ins) |
-| Kotlin + Compose type-check of every changed UI file and `MainActivity` | Compiles (against Compose Multiplatform 1.7.3 desktop + stand-ins for Android-only APIs) |
-| Gradle Android build, APK, Robolectric tests, emulator/device runs | **Not run.** The review environment cannot download the Android SDK or Google Maven artifacts. `LedgerRepositoryRuleTest` was updated but not executed. |
+| `./gradlew assembleDebug` (Android SDK 36.1, AGP 9.1.1, Gradle 9.3.1) | **Builds**; `app-debug.apk` produced |
+| `./gradlew assembleRelease` signed with a throwaway test key | **Builds**; `app-release.apk` produced |
+| `./gradlew lintDebug` | **0 errors** (only style/version warnings) |
+| `./gradlew testDebugUnitTest` with the Auth + Firestore emulators running | **19/19 pass**: 12 money/validation/key tests, the Robolectric formatting test, and 5 repository tests against the emulators (sign-in, approval, sales, immutable reports and history, new cycle, archive checkbox and void, isolation, no-workspace) |
+| `firestore.test.js` against the Firestore emulator | **9/9 pass**: T01–T08 and a 500-sale archive/report test |
+| `PdfExportInstrumentedTest` (real PDF file, 120 rows, several pages) | Compiles; **not run**: it needs a phone or emulator, and this machine can't run an Android emulator |
+| On a real phone: Google sign-in, offline use, PDF save/share, layout at small widths and large fonts | **Not run**: needs your phone and your real Firebase project |
 
-Before release, run `./gradlew assembleDebug testDebugUnitTest` locally and try sign-in, offline use and a PDF export on a real phone.
+Found while building: `firebase_applet_config.xml.example` was inside `res/values`, which makes every Android build fail ("The file name must end with .xml"). It now lives at `app/firebase_applet_config.xml.example`. The repository also had no `gradlew` script; the Gradle wrapper is now included.
 
 ## Done
 
@@ -56,7 +58,7 @@ Before release, run `./gradlew assembleDebug testDebugUnitTest` locally and try 
 | **OFF-01 … OFF-05** Room database + outbox + WorkManager | The app relies on Firestore's on-device cache, which already saves changes locally and syncs later (statuses: *Saved on this phone*, *Queued*, *Uploaded*). A full Room/outbox layer is a large redesign that must be built and tested on devices. |
 | **DATA-02** Item sub-collections for cycles over 500 sales | Over 500 is refused up front for now; nothing is truncated. |
 | **UI-04** Move every string to `strings.xml` | Mechanical but touches every screen; best done together with any Persian translation. |
-| **T21–T29** Screenshot renders at 320–411 dp and large fonts, TalkBack, real sign-in, release build | Needs an Android build and a device or emulator. |
+| **T21–T29** Screenshot renders at 320–411 dp and large fonts, TalkBack, real sign-in | Needs a phone (the APK itself now builds). |
 | **PRIV-03** App Check, R8 shrinking | Must be tested on a real build before enforcing, or sellers could be locked out. |
 | **#7 / §10** Business rules: whether unpaid sales count toward the amount due, who absorbs discounts and losses, seller→Admin payment records | Business decisions; the current behaviour (everything counts, profits share discounts and losses) is unchanged and documented in the README. |
 | **#8** Cross-checking reports against the Remnawave panel | Optional, needs a trusted backend so panel credentials never ship in the APK. |

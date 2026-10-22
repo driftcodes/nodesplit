@@ -20,7 +20,7 @@ Step-by-step instructions (Firebase console, project files, Android Studio, sign
 
 1. Create a Firebase project with **Google** sign-in and Firestore enabled.
 2. Put your `google-services.json` in `app/` (see `app/google-services.json.example`), and register the SHA-1/SHA-256 fingerprints of the key you sign with.
-3. Copy `app/src/main/res/values/firebase_applet_config.xml.example` to `firebase_applet_config.xml` and set your Firestore database ID.
+3. Copy `app/firebase_applet_config.xml.example` to `app/src/main/res/values/firebase_applet_config.xml` and set your Firestore database ID.
 4. Deploy the rules: `firebase deploy --only firestore:rules`. If you use a named database, set `"database"` in `firebase.json` to that ID first.
 5. **Create the workspace by hand.** The app can no longer create it (otherwise the first stranger to sign in would become Admin). Sign in once with the owner's Google account; the app shows *Workspace not set up yet* with your user ID. In the Firebase console create the document `config/workspace` with:
 
@@ -63,7 +63,13 @@ Deploy in this order:
   npx firebase emulators:exec --project demo-no-project --only firestore "node --test firestore.test.js"
   ```
 
-- **Money, validation and key logic** (`app/src/test/java/com/example/data/model/FinancialRulesTest.kt`): plain JUnit, `./gradlew testDebugUnitTest --tests "*FinancialRulesTest"`.
-- **Repository against the emulators** (`LedgerRepositoryRuleTest`, Robolectric): start the Auth and Firestore emulators (`firebase emulators:start --only auth,firestore`), then `./gradlew testDebugUnitTest`.
+- **All JVM tests** (money logic, Robolectric, repository against the emulators), 19 tests:
+
+  ```
+  npx firebase emulators:exec --project demo-no-project --only auth,firestore "./gradlew testDebugUnitTest"
+  ```
+
+  Without the emulators, run only the pure tests: `./gradlew testDebugUnitTest --tests "com.example.data.model.FinancialRulesTest"`.
+- **On a device** (real PDF output): `./gradlew connectedDebugAndroidTest` with a phone connected.
 
 See `security_spec.md` for the security model and `CHANGES.md` for what changed and what is still open.
