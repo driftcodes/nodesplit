@@ -3,7 +3,6 @@ package com.example.data.repository
 import android.content.Context
 import com.example.R
 import com.example.data.model.ApprovedEmail
-import com.example.data.model.ArchivedSaleItem
 import com.example.data.model.DataPreset
 import com.example.data.model.LedgerArchive
 import com.example.data.model.SaleEntry
@@ -22,15 +21,20 @@ import com.google.android.gms.tasks.Task
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FieldPath
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.MetadataChanges
 import com.google.firebase.firestore.Source
+import com.google.firebase.firestore.WriteBatch
 import com.google.firebase.firestore.snapshots
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeoutOrNull
@@ -41,6 +45,15 @@ enum class WriteAckStatus {
     SAVED_OFFLINE_PENDING_SYNC
 }
 
+/** SEC-04: The workspace is created once by the owner in the Firebase console, never by the app. */
+class WorkspaceNotConfiguredException(val signedInUid: String) :
+    IllegalStateException("This NodeSplit workspace has not been set up yet.")
+
+/** DATA-02: Another device changed or removed a sale between the screen snapshot and the reset. */
+class ConcurrentLedgerEditException :
+    IllegalStateException("Sales changed on another device while starting the new cycle. Nothing was archived or deleted. Check the list and try again.")
+
+@OptIn(ExperimentalCoroutinesApi::class)
 class LedgerRepository(
     private val db: FirebaseFirestore,
     private val auth: FirebaseAuth = FirebaseAuth.getInstance()
@@ -57,6 +70,9 @@ class LedgerRepository(
         return auth.currentUser?.uid
             ?: throw IllegalStateException("User must be signed in with Google before accessing Firestore.")
     }
+
+    private fun ledgerCollection(ledgerOwnerUid: String, collection: String) =
+        db.collection("ledgers").document(ledgerOwnerUid).collection(collection)
 
     /**
      * OFF-01 / OFF-03: Firestore commits mutations to its local durable persistence immediately when
@@ -107,55 +123,52 @@ class LedgerRepository(
         }
     }
 
-    // --- 1. Workspace Bootstrap, Real-Time Config & User Profile Resolution ---
+    // --- 1. Workspace, Real-Time Config & User Profile Resolution ---
 
     suspend fun getOrBootstrapWorkspaceAndProfile(
         uid: String,
         email: String,
         displayName: String
     ): Result<Pair<WorkspaceConfig, UserProfile>> {
-        val safeEmail = TomanFormatter.canonicalizeEmail(email).ifBlank { "$uid@user.nodesplit.app" }
-        val emailKey = TomanFormatter.emailToSafeKey(safeEmail)
-        val legacyEmailKey = TomanFormatter.legacyEmailToSafeKey(safeEmail)
+        val safeEmail = TomanFormatter.canonicalizeEmail(email)
+        val newEmailKey = TomanFormatter.invitationKeyFor(safeEmail)
         val safeName = displayName.trim().ifBlank { safeEmail.substringBefore("@").ifBlank { "VPN Seller" } }.take(90)
-        val workspaceRef = db.collection("config").document("workspace")
 
         return try {
-            var workspaceSnap = try {
+            val workspaceSnap = try {
                 getDocumentWithOfflineFallback("config", "workspace")
-            } catch (_: Exception) {
-                workspaceRef.get().await()
+            } catch (e: FirebaseFirestoreException) {
+                if (e.code == FirebaseFirestoreException.Code.UNAVAILABLE) throw e
+                db.collection("config").document("workspace").get().await()
             }
 
             if (!workspaceSnap.exists()) {
-                // First user to launch initializes the workspace as Admin
-                val initPayload = mapOf(
-                    "adminUid" to uid,
-                    "adminEmail" to "",
-                    "businessName" to "NodeSplit VPN",
-                    "costPerGbToman" to 1_000L,
-                    "adminProfitPercent" to 50,
-                    "settingsRevision" to 1L,
-                    "createdAt" to FieldValue.serverTimestamp(),
-                    "updatedAt" to FieldValue.serverTimestamp()
-                )
-                workspaceRef.set(initPayload).await()
-                workspaceSnap = workspaceRef.get().await()
+                // A cache miss while offline is not proof that the workspace is missing.
+                if (workspaceSnap.metadata.isFromCache) {
+                    return Result.failure(
+                        IllegalStateException("Connect to the internet to finish the first sign-in on this device.")
+                    )
+                }
+                return Result.failure(WorkspaceNotConfiguredException(uid))
             }
 
             val workspace = workspaceSnap.toWorkspaceConfigOrNull()
                 ?: return Result.failure(
                     IllegalStateException("Workspace configuration could not be loaded. Connect to the internet to finish initial setup.")
                 )
+            if (workspace.adminUid.isBlank()) {
+                return Result.failure(WorkspaceNotConfiguredException(uid))
+            }
 
-            val adminUid = workspace.adminUid.ifBlank { uid }
+            val adminUid = workspace.adminUid
             // SEC-04: Admin authority is bound strictly to workspace.adminUid (no hardcoded email backdoors)
             val isUserWorkspaceAdmin = (uid == adminUid)
 
             val userRef = db.collection("users").document(uid)
             val userSnap = try {
                 getDocumentWithOfflineFallback("users", uid)
-            } catch (_: Exception) {
+            } catch (e: FirebaseFirestoreException) {
+                if (e.code == FirebaseFirestoreException.Code.UNAVAILABLE) throw e
                 userRef.get().await()
             }
 
@@ -163,47 +176,42 @@ class LedgerRepository(
                 val existingProfile = userSnap.toUserProfileOrNull()
                     ?: return Result.failure(IllegalStateException("Account profile data is invalid."))
 
-                // SEC-03: Only a PENDING seller can be upgraded via pre-approved email; REVOKED never self-reverses
-                if (existingProfile.role == "SELLER" && existingProfile.status == "PENDING") {
-                    val approvedCheck = checkEmailPreApproved(emailKey, legacyEmailKey, safeEmail)
-                    if (approvedCheck != null && approvedCheck.status == "APPROVED") {
+                // SEC-03: Only a PENDING seller can be upgraded via an invitation; REVOKED never self-reverses
+                if (existingProfile.role == "SELLER" && existingProfile.status == "PENDING" && safeEmail.isNotBlank()) {
+                    val invitation = findApprovedInvitation(safeEmail)
+                    if (invitation != null) {
                         userRef.update(
                             mapOf(
                                 "status" to "APPROVED",
-                                "displayName" to approvedCheck.sellerName.ifBlank { existingProfile.displayName }.take(90),
+                                "emailKey" to invitation.emailKey,
+                                "displayName" to invitation.sellerName.ifBlank { existingProfile.displayName }.take(90),
                                 "updatedAt" to FieldValue.serverTimestamp()
                             )
                         ).await()
-                        val updatedSnap = userRef.get().await()
-                        val updatedProfile = updatedSnap.toUserProfileOrNull()
-                            ?: existingProfile.copy(status = "APPROVED")
+                        val updatedProfile = userRef.get().await().toUserProfileOrNull()
+                            ?: existingProfile.copy(status = "APPROVED", emailKey = invitation.emailKey)
                         return Result.success(workspace to updatedProfile)
                     }
                 }
                 Result.success(workspace to existingProfile)
             } else {
-                // Check if Admin already pre-approved this Seller email before creating profile
-                val preApproved = if (!isUserWorkspaceAdmin) {
-                    checkEmailPreApproved(emailKey, legacyEmailKey, safeEmail)
-                } else {
-                    null
+                if (userSnap.metadata.isFromCache) {
+                    return Result.failure(
+                        IllegalStateException("Connect to the internet to finish the first sign-in on this device.")
+                    )
                 }
-                val isPreApprovedSeller = preApproved != null &&
-                    preApproved.status == "APPROVED" &&
-                    TomanFormatter.canonicalizeEmail(preApproved.email) == safeEmail
+                if (safeEmail.isBlank() || newEmailKey == null) {
+                    return Result.failure(
+                        IllegalStateException("This Google account has no usable email address. Sign in with a different Google account.")
+                    )
+                }
+                // Check whether the Admin already invited this Google email before creating the profile
+                val invitation = if (!isUserWorkspaceAdmin) findApprovedInvitation(safeEmail) else null
 
-                val effectiveEmailKey = if (isPreApprovedSeller && preApproved != null) {
-                    preApproved.emailKey.ifBlank { emailKey }
-                } else {
-                    emailKey
-                }
                 val initialRole = if (isUserWorkspaceAdmin) "ADMIN" else "SELLER"
-                val initialStatus = if (isUserWorkspaceAdmin || isPreApprovedSeller) "APPROVED" else "PENDING"
-                val finalDisplayName = if (isPreApprovedSeller && preApproved != null && preApproved.sellerName.isNotBlank()) {
-                    preApproved.sellerName.take(90)
-                } else {
-                    safeName
-                }
+                val initialStatus = if (isUserWorkspaceAdmin || invitation != null) "APPROVED" else "PENDING"
+                val effectiveEmailKey = invitation?.emailKey ?: newEmailKey
+                val finalDisplayName = invitation?.sellerName?.takeIf { it.isNotBlank() }?.take(90) ?: safeName
 
                 val newProfileMap = mapOf(
                     "userId" to uid,
@@ -218,8 +226,7 @@ class LedgerRepository(
                 )
                 userRef.set(newProfileMap).await()
 
-                val createdSnap = userRef.get().await()
-                val createdProfile = createdSnap.toUserProfileOrNull()
+                val createdProfile = userRef.get().await().toUserProfileOrNull()
                     ?: UserProfile(
                         id = uid,
                         userId = uid,
@@ -240,29 +247,25 @@ class LedgerRepository(
         }
     }
 
-    private suspend fun checkEmailPreApproved(
-        primaryKey: String,
-        legacyKey: String,
-        expectedEmail: String
-    ): ApprovedEmail? {
-        val primary = try {
-            val snap = db.collection("approved_emails").document(primaryKey).get().await()
-            snap.toApprovedEmailOrNull()
-        } catch (_: Exception) {
-            null
-        }
-        if (primary != null && TomanFormatter.canonicalizeEmail(primary.email) == expectedEmail) {
-            return primary
-        }
-        if (legacyKey != primaryKey) {
-            val legacy = try {
-                val snap = db.collection("approved_emails").document(legacyKey).get().await()
-                snap.toApprovedEmailOrNull()
+    /**
+     * Looks up an APPROVED invitation for the signed-in email under the current key scheme and the
+     * two older ones. The rules only let a seller read their own invitation, so a lookup for any
+     * other key is denied (and ignored here).
+     */
+    private suspend fun findApprovedInvitation(canonicalEmail: String): ApprovedEmail? {
+        for (key in TomanFormatter.candidateInvitationKeys(canonicalEmail)) {
+            val invitation = try {
+                db.collection("approved_emails").document(key).get().await().toApprovedEmailOrNull()
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 null
             }
-            if (legacy != null && TomanFormatter.canonicalizeEmail(legacy.email) == expectedEmail) {
-                return legacy
+            if (invitation != null &&
+                TomanFormatter.canonicalizeEmail(invitation.email) == canonicalEmail &&
+                invitation.status == "APPROVED"
+            ) {
+                return invitation.copy(emailKey = key)
             }
         }
         return null
@@ -285,13 +288,14 @@ class LedgerRepository(
         costPerGbToman: Long,
         adminProfitPercent: Int
     ): Result<Unit> {
-        requireUserId()
         val docRef = db.collection("config").document("workspace")
         return try {
+            requireUserId()
             docRef.update(
                 mapOf(
                     "costPerGbToman" to costPerGbToman.coerceIn(0L, 1_000_000_000L),
                     "adminProfitPercent" to adminProfitPercent.coerceIn(0, 100),
+                    "settingsRevision" to FieldValue.increment(1),
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
             ).await()
@@ -351,51 +355,59 @@ class LedgerRepository(
             }
     }
 
+    /**
+     * Admin approves a Google email. The invitation (under the canonical email key) and any matching
+     * seller profile are written in one batch, and any copy under an old key scheme is removed in
+     * that same batch (SEC-02 / SEC-03).
+     */
     suspend fun addOrApproveSellerEmail(
         workspaceAdminUid: String,
         email: String,
         sellerName: String
     ): Result<String> {
-        requireUserId()
         val cleanEmail = TomanFormatter.canonicalizeEmail(email)
-        val emailKey = TomanFormatter.emailToSafeKey(cleanEmail)
+        val emailKey = TomanFormatter.invitationKeyFor(cleanEmail)
+            ?: return Result.failure(IllegalArgumentException("Enter a valid Google email address."))
         val cleanName = sellerName.trim().ifBlank { cleanEmail.substringBefore("@") }.take(90)
         val docRef = db.collection("approved_emails").document(emailKey)
 
         return try {
+            requireUserId()
+            val batch = db.batch()
             val existingSnap = docRef.get().await()
             if (existingSnap.exists()) {
-                docRef.update(
+                batch.update(
+                    docRef,
                     mapOf(
                         "sellerName" to cleanName,
                         "status" to "APPROVED",
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
-                ).await()
-            } else {
-                val payload = mapOf(
-                    "emailKey" to emailKey,
-                    "email" to cleanEmail,
-                    "sellerName" to cleanName,
-                    "workspaceAdminUid" to workspaceAdminUid,
-                    "status" to "APPROVED",
-                    "createdAt" to FieldValue.serverTimestamp(),
-                    "updatedAt" to FieldValue.serverTimestamp()
                 )
-                docRef.set(payload).await()
+            } else {
+                batch.set(
+                    docRef,
+                    mapOf(
+                        "emailKey" to emailKey,
+                        "email" to cleanEmail,
+                        "sellerName" to cleanName,
+                        "workspaceAdminUid" to workspaceAdminUid,
+                        "status" to "APPROVED",
+                        "createdAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                )
             }
+            deleteLegacyInvitationCopies(batch, cleanEmail, keepKey = emailKey)
 
-            // Also atomically update any matching seller profile in /users if they already signed in
+            // Approve a seller who already signed in with exactly this email.
             val matchingUsers = db.collection("users")
                 .whereEqualTo("workspaceAdminUid", workspaceAdminUid)
                 .get()
                 .await()
-            val batch = db.batch()
-            var hasUserUpdates = false
             for (userDoc in matchingUsers.documents) {
                 val docEmail = TomanFormatter.canonicalizeEmail(userDoc.getString("email") ?: "")
-                val docEmailKey = userDoc.getString("emailKey") ?: ""
-                if ((docEmail == cleanEmail || docEmailKey == emailKey) && userDoc.getString("role") == "SELLER") {
+                if (docEmail == cleanEmail && userDoc.getString("role") == "SELLER") {
                     batch.update(
                         userDoc.reference,
                         mapOf(
@@ -404,12 +416,9 @@ class LedgerRepository(
                             "updatedAt" to FieldValue.serverTimestamp()
                         )
                     )
-                    hasUserUpdates = true
                 }
             }
-            if (hasUserUpdates) {
-                batch.commit().await()
-            }
+            batch.commit().await()
             Result.success(emailKey)
         } catch (e: CancellationException) {
             throw e
@@ -419,6 +428,70 @@ class LedgerRepository(
         }
     }
 
+    private suspend fun deleteLegacyInvitationCopies(
+        batch: WriteBatch,
+        canonicalEmail: String,
+        keepKey: String
+    ) {
+        for (oldKey in TomanFormatter.candidateInvitationKeys(canonicalEmail)) {
+            if (oldKey == keepKey) continue
+            val oldRef = db.collection("approved_emails").document(oldKey)
+            val oldSnap = oldRef.get().await()
+            // Only remove an old document that really belongs to this address (old keys could collide).
+            if (oldSnap.exists() && TomanFormatter.canonicalizeEmail(oldSnap.getString("email") ?: "") == canonicalEmail) {
+                batch.delete(oldRef)
+            }
+        }
+    }
+
+    /**
+     * One-time, idempotent move of invitations stored under the old collision-prone keys to the
+     * canonical email key. Only the stored email decides the new key, so two addresses that shared an
+     * old key are never both approved by copying one document.
+     */
+    suspend fun migrateLegacyInvitationKeys(workspaceAdminUid: String): Result<Int> {
+        return try {
+            requireUserId()
+            val snap = db.collection("approved_emails")
+                .whereEqualTo("workspaceAdminUid", workspaceAdminUid)
+                .get(Source.SERVER)
+                .await()
+            var moved = 0
+            val batch = db.batch()
+            for (doc in snap.documents) {
+                val invitation = doc.toApprovedEmailOrNull() ?: continue
+                val newKey = TomanFormatter.invitationKeyFor(invitation.email) ?: continue
+                if (doc.id == newKey) continue
+                val newRef = db.collection("approved_emails").document(newKey)
+                val alreadyMoved = snap.documents.any { it.id == newKey }
+                if (!alreadyMoved) {
+                    batch.set(
+                        newRef,
+                        mapOf(
+                            "emailKey" to newKey,
+                            "email" to TomanFormatter.canonicalizeEmail(invitation.email),
+                            "sellerName" to invitation.sellerName.ifBlank { invitation.email.substringBefore("@") }.take(90),
+                            "workspaceAdminUid" to workspaceAdminUid,
+                            "status" to invitation.status,
+                            "createdAt" to FieldValue.serverTimestamp(),
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                }
+                batch.delete(doc.reference)
+                moved++
+            }
+            if (moved > 0) batch.commit().await()
+            Result.success(moved)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.WRITE, "approved_emails")
+            Result.failure(e)
+        }
+    }
+
+    /** Admin approves or revokes a registered seller. Profile and invitation change atomically. */
     suspend fun updateSellerStatus(
         sellerUid: String,
         emailKey: String,
@@ -427,12 +500,11 @@ class LedgerRepository(
         workspaceAdminUid: String,
         approve: Boolean
     ): Result<Unit> {
-        requireUserId()
         val newStatus = if (approve) "APPROVED" else "REVOKED"
         val userRef = db.collection("users").document(sellerUid)
         return try {
+            requireUserId()
             val cleanEmail = TomanFormatter.canonicalizeEmail(email)
-            val resolvedEmailKey = emailKey.ifBlank { TomanFormatter.emailToSafeKey(cleanEmail) }
             val batch = db.batch()
 
             batch.update(
@@ -443,8 +515,9 @@ class LedgerRepository(
                 )
             )
 
-            if (resolvedEmailKey.isNotBlank() && cleanEmail.isNotBlank()) {
-                val emailRef = db.collection("approved_emails").document(resolvedEmailKey)
+            val invitationKey = TomanFormatter.invitationKeyFor(cleanEmail)
+            if (invitationKey != null) {
+                val emailRef = db.collection("approved_emails").document(invitationKey)
                 val emailSnap = emailRef.get().await()
                 if (emailSnap.exists()) {
                     batch.update(
@@ -458,7 +531,7 @@ class LedgerRepository(
                     batch.set(
                         emailRef,
                         mapOf(
-                            "emailKey" to resolvedEmailKey,
+                            "emailKey" to invitationKey,
                             "email" to cleanEmail,
                             "sellerName" to sellerName.ifBlank { cleanEmail.substringBefore("@") }.take(90),
                             "workspaceAdminUid" to workspaceAdminUid,
@@ -467,6 +540,13 @@ class LedgerRepository(
                             "updatedAt" to FieldValue.serverTimestamp()
                         )
                     )
+                }
+                // An old-scheme invitation must not be left APPROVED next to a revoked profile.
+                deleteLegacyInvitationCopies(batch, cleanEmail, keepKey = invitationKey)
+            } else if (emailKey.isNotBlank()) {
+                val legacyRef = db.collection("approved_emails").document(emailKey)
+                if (legacyRef.get().await().exists()) {
+                    batch.update(legacyRef, mapOf("status" to newStatus, "updatedAt" to FieldValue.serverTimestamp()))
                 }
             }
             batch.commit().await()
@@ -479,10 +559,11 @@ class LedgerRepository(
         }
     }
 
+    /** Cancels an invitation. It does not revoke a seller who already signed in (use Revoke for that). */
     suspend fun removeApprovedEmail(emailKey: String): Result<Unit> {
-        requireUserId()
         val docRef = db.collection("approved_emails").document(emailKey)
         return try {
+            requireUserId()
             docRef.delete().await()
             Result.success(Unit)
         } catch (e: CancellationException) {
@@ -500,13 +581,9 @@ class LedgerRepository(
         workspaceAdminUid: String
     ): Flow<List<SaleEntry>> {
         val path = "ledgers/$ledgerOwnerUid/entries"
-        val baseQuery = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("entries")
+        return ledgerCollection(ledgerOwnerUid, "entries")
             .whereEqualTo("ledgerOwnerUid", ledgerOwnerUid)
             .whereEqualTo("workspaceAdminUid", workspaceAdminUid)
-
-        return baseQuery
             .snapshots(MetadataChanges.INCLUDE)
             .map { snapshot ->
                 snapshot.documents.mapNotNull { doc ->
@@ -525,9 +602,7 @@ class LedgerRepository(
     ): Result<List<SaleEntry>> {
         val path = "ledgers/$ledgerOwnerUid/entries"
         return try {
-            val snap = db.collection("ledgers")
-                .document(ledgerOwnerUid)
-                .collection("entries")
+            val snap = ledgerCollection(ledgerOwnerUid, "entries")
                 .whereEqualTo("ledgerOwnerUid", ledgerOwnerUid)
                 .whereEqualTo("workspaceAdminUid", workspaceAdminUid)
                 .get()
@@ -558,7 +633,6 @@ class LedgerRepository(
         bonusGb: Double = 0.0,
         deterministicEntryId: String? = null
     ): Result<String> {
-        requireUserId()
         if (!dataGb.isFinite() || dataGb <= 0.0 || dataGb > SaleEntry.MAX_ALLOWED_GB) {
             return Result.failure(IllegalArgumentException("Data volume must be between 0.1 and 100,000 GB."))
         }
@@ -566,12 +640,9 @@ class LedgerRepository(
             return Result.failure(IllegalArgumentException("Sale price is out of valid Toman range."))
         }
         val safeBonus = if (isNewUser && bonusGb.isFinite()) bonusGb.coerceIn(0.0, dataGb) else 0.0
-        val entryId = deterministicEntryId?.takeIf { it.isNotBlank() }
-            ?: "sale_${UUID.randomUUID().toString().replace("-", "").take(20)}"
-        val docRef = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("entries")
-            .document(entryId)
+        // OFF-03: The id is fixed before the first attempt so a retry rewrites the same sale.
+        val entryId = deterministicEntryId?.takeIf { it.isNotBlank() } ?: newSaleId()
+        val docRef = ledgerCollection(ledgerOwnerUid, "entries").document(entryId)
 
         val payload = mapOf(
             "ledgerOwnerUid" to ledgerOwnerUid,
@@ -590,6 +661,7 @@ class LedgerRepository(
         )
 
         return try {
+            requireUserId()
             awaitServerOrQueueOffline(docRef.set(payload), OperationType.CREATE, docRef.path)
             Result.success(entryId)
         } catch (e: CancellationException) {
@@ -605,13 +677,10 @@ class LedgerRepository(
         entryId: String,
         isPaid: Boolean
     ): Result<Unit> {
-        requireUserId()
-        val docRef = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("entries")
-            .document(entryId)
+        val docRef = ledgerCollection(ledgerOwnerUid, "entries").document(entryId)
 
         return try {
+            requireUserId()
             awaitServerOrQueueOffline(
                 docRef.update(
                     mapOf(
@@ -644,7 +713,6 @@ class LedgerRepository(
         isNewUser: Boolean = false,
         bonusGb: Double = 0.0
     ): Result<Unit> {
-        requireUserId()
         if (!dataGb.isFinite() || dataGb <= 0.0 || dataGb > SaleEntry.MAX_ALLOWED_GB) {
             return Result.failure(IllegalArgumentException("Data volume must be between 0.1 and 100,000 GB."))
         }
@@ -652,12 +720,10 @@ class LedgerRepository(
             return Result.failure(IllegalArgumentException("Sale price is out of valid Toman range."))
         }
         val safeBonus = if (isNewUser && bonusGb.isFinite()) bonusGb.coerceIn(0.0, dataGb) else 0.0
-        val docRef = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("entries")
-            .document(entryId)
+        val docRef = ledgerCollection(ledgerOwnerUid, "entries").document(entryId)
 
         return try {
+            requireUserId()
             awaitServerOrQueueOffline(
                 docRef.update(
                     mapOf(
@@ -689,13 +755,10 @@ class LedgerRepository(
         ledgerOwnerUid: String,
         entryId: String
     ): Result<Unit> {
-        requireUserId()
-        val docRef = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("entries")
-            .document(entryId)
+        val docRef = ledgerCollection(ledgerOwnerUid, "entries").document(entryId)
 
         return try {
+            requireUserId()
             awaitServerOrQueueOffline(docRef.delete(), OperationType.DELETE, docRef.path)
             Result.success(Unit)
         } catch (e: CancellationException) {
@@ -706,8 +769,57 @@ class LedgerRepository(
         }
     }
 
-    // --- 4. Reset Ledger, Archive Cycle & Seller Sent List (DATA-01, DATA-02, DATA-03) ---
+    // --- 4. Close Cycle, Archives & Sent Reports (DATA-01, DATA-02, DATA-03) ---
 
+    private fun buildSnapshotPayload(
+        ledgerOwnerUid: String,
+        workspaceAdminUid: String,
+        ownerName: String,
+        cycleTitle: String,
+        entries: List<SaleEntry>,
+        costPerGbToman: Long,
+        adminProfitPercent: Int,
+        settingsRevision: Long
+    ): Map<String, Any> {
+        val totalSales = entries.sumOf { it.safePriceToman }
+        val paidSales = entries.filter { it.isPaid }.sumOf { it.safePriceToman }
+        val itemsList = entries.mapIndexed { idx, entry -> entry.toArchiveItemMap(idx) }
+        val paidMap = itemsList.associate { item ->
+            (item["itemId"] as String) to (item["isPaid"] as Boolean)
+        }
+        val cleanOwnerName = TomanFormatter.sanitizeOwnerDisplayName(ownerName).take(100)
+        return mapOf(
+            "ledgerOwnerUid" to ledgerOwnerUid,
+            "workspaceAdminUid" to workspaceAdminUid,
+            "ownerName" to cleanOwnerName.ifBlank { "Seller" },
+            "cycleTitle" to cycleTitle.trim().ifBlank { "Settlement Archive" }.take(120),
+            "totalSalesToman" to totalSales,
+            "paidToman" to paidSales,
+            "unpaidToman" to (totalSales - paidSales).coerceAtLeast(0L),
+            "totalGb" to entries.sumOf { it.safeDataGb },
+            "costPerGbToman" to costPerGbToman.coerceIn(0L, 1_000_000_000L),
+            "adminProfitPercent" to adminProfitPercent.coerceIn(0, 100),
+            "settingsRevision" to settingsRevision.coerceAtLeast(1L),
+            "entryCount" to itemsList.size,
+            "items" to itemsList,
+            "paidMap" to paidMap,
+            "schemaVersion" to SNAPSHOT_SCHEMA_VERSION,
+            "clientCreatedAtMillis" to System.currentTimeMillis(),
+            "createdAt" to FieldValue.serverTimestamp()
+        )
+    }
+
+    private fun tooManyEntries(count: Int): Exception =
+        IllegalArgumentException(
+            "This cycle has $count sales, over the $MAX_ARCHIVE_ITEMS-sale snapshot limit. Nothing was changed. Export a PDF first, then contact the developer to raise the limit."
+        )
+
+    /**
+     * Starts a new cycle. When online the archive is written in a transaction that re-reads every
+     * sale and aborts if another device changed or removed one (DATA-02). Offline, a single atomic
+     * batch is queued instead (Firestore cannot run transactions offline). Only the captured sale
+     * ids are deleted, so a sale added concurrently stays in the new cycle.
+     */
     suspend fun resetAndArchiveLedger(
         ledgerOwnerUid: String,
         workspaceAdminUid: String,
@@ -717,82 +829,86 @@ class LedgerRepository(
         keepArchive: Boolean,
         costPerGbToman: Long = 1_000L,
         adminProfitPercent: Int = 50,
+        settingsRevision: Long = 1L,
         deterministicArchiveId: String? = null
     ): Result<String?> {
-        requireUserId()
-        // DATA-02: Never truncate entries above 500 while deleting the rest! Guard before any write.
+        // DATA-02: Never truncate. Reject before any write.
         if (activeEntries.size > MAX_ARCHIVE_ITEMS) {
-            return Result.failure(
-                IllegalArgumentException(
-                    "Active cycle has ${activeEntries.size} sales, exceeding the $MAX_ARCHIVE_ITEMS-record snapshot limit. Export a PDF first before splitting the cycle."
-                )
-            )
+            return Result.failure(tooManyEntries(activeEntries.size))
         }
-
-        val entriesCollection = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("entries")
-
-        val archivesCollection = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("archives")
-
+        val path = "ledgers/$ledgerOwnerUid/archives"
         return try {
-            val batch = db.batch()
-            var createdArchiveId: String? = null
-
-            if (keepArchive && activeEntries.isNotEmpty()) {
-                val archiveId = deterministicArchiveId?.takeIf { it.isNotBlank() }
-                    ?: "arch_${UUID.randomUUID().toString().replace("-", "").take(20)}"
-                createdArchiveId = archiveId
-                val archiveRef = archivesCollection.document(archiveId)
-
-                val totalSales = activeEntries.sumOf { it.safePriceToman }
-                val paidSales = activeEntries.filter { it.isPaid }.sumOf { it.safePriceToman }
-                val unpaidSales = (totalSales - paidSales).coerceAtLeast(0L)
-                val totalGb = activeEntries.sumOf { it.safeDataGb }
-                val itemsList = activeEntries.mapIndexed { idx, entry -> entry.toArchiveItemMap(idx) }
-                val paidMap = itemsList.associate { item ->
-                    (item["itemId"] as String) to (item["isPaid"] as Boolean)
-                }
-                val cleanOwnerName = TomanFormatter.sanitizeOwnerDisplayName(ownerName).take(100)
-
-                val archivePayload = mapOf(
-                    "ledgerOwnerUid" to ledgerOwnerUid,
-                    "workspaceAdminUid" to workspaceAdminUid,
-                    "ownerName" to cleanOwnerName.ifBlank { "Seller" },
-                    "cycleTitle" to cycleTitle.trim().ifBlank { "Settlement Archive" }.take(120),
-                    "totalSalesToman" to totalSales,
-                    "paidToman" to paidSales,
-                    "unpaidToman" to unpaidSales,
-                    "totalGb" to totalGb,
-                    "costPerGbToman" to costPerGbToman.coerceAtLeast(0L),
-                    "adminProfitPercent" to adminProfitPercent.coerceIn(0, 100),
-                    "entryCount" to itemsList.size,
-                    "items" to itemsList,
-                    "paidMap" to paidMap,
-                    "createdAt" to FieldValue.serverTimestamp()
+            val currentUid = requireUserId()
+            val entriesCollection = ledgerCollection(ledgerOwnerUid, "entries")
+            val archiveId = if (keepArchive && activeEntries.isNotEmpty()) {
+                deterministicArchiveId?.takeIf { it.isNotBlank() } ?: newArchiveId()
+            } else {
+                null
+            }
+            val archiveRef = archiveId?.let { ledgerCollection(ledgerOwnerUid, LedgerArchive.COLLECTION_ARCHIVES).document(it) }
+            val archivePayload = archiveId?.let {
+                buildSnapshotPayload(
+                    ledgerOwnerUid, workspaceAdminUid, ownerName, cycleTitle, activeEntries,
+                    costPerGbToman, adminProfitPercent, settingsRevision
                 )
-                batch.set(archiveRef, archivePayload)
             }
-
-            // DATA-01: Delete the exact active entries captured in this reset batch
-            for (entry in activeEntries) {
-                if (entry.id.isNotBlank()) {
-                    batch.delete(entriesCollection.document(entry.id))
-                }
+            // A seller's new cycle clears the "current report" pointer so the admin no longer sees
+            // the previous report as this seller's active book (the report itself stays in history).
+            val pointerRef = if (currentUid == ledgerOwnerUid && ledgerOwnerUid != workspaceAdminUid) {
+                ledgerCollection(ledgerOwnerUid, "pointers").document(LATEST_SUBMISSION_POINTER_ID)
+            } else {
+                null
             }
-
-            awaitServerOrQueueOffline(
-                batch.commit(),
-                OperationType.WRITE,
-                "ledgers/$ledgerOwnerUid/archives"
+            val pointerPayload = mapOf(
+                "ledgerOwnerUid" to ledgerOwnerUid,
+                "workspaceAdminUid" to workspaceAdminUid,
+                "submissionId" to "",
+                "updatedAt" to FieldValue.serverTimestamp()
             )
-            Result.success(createdArchiveId)
+            val validEntries = activeEntries.filter { it.id.isNotBlank() }
+            val canVerifyOnServer = validEntries.none { it.hasPendingSync }
+
+            val ranTransaction = canVerifyOnServer && try {
+                withTimeoutOrNull(TRANSACTION_TIMEOUT_MS) {
+                    db.runTransaction { tx ->
+                        for (entry in validEntries) {
+                            val serverCopy = tx.get(entriesCollection.document(entry.id)).toSaleEntryOrNull()
+                            if (serverCopy == null || serverCopy.copy(hasPendingSync = false) != entry.copy(hasPendingSync = false)) {
+                                throw ConcurrentLedgerEditException()
+                            }
+                        }
+                        if (archiveRef != null && archivePayload != null) tx.set(archiveRef, archivePayload)
+                        for (entry in validEntries) tx.delete(entriesCollection.document(entry.id))
+                        if (pointerRef != null) tx.set(pointerRef, pointerPayload)
+                        null
+                    }.await()
+                    true
+                } ?: false
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (e is ConcurrentLedgerEditException || e.cause is ConcurrentLedgerEditException) {
+                    throw ConcurrentLedgerEditException()
+                }
+                // Offline: fall back to a queued batch. Any other failure is real and is reported.
+                if ((e as? FirebaseFirestoreException)?.code != FirebaseFirestoreException.Code.UNAVAILABLE) throw e
+                false
+            }
+
+            if (!ranTransaction) {
+                val batch = db.batch()
+                if (archiveRef != null && archivePayload != null) batch.set(archiveRef, archivePayload)
+                for (entry in validEntries) batch.delete(entriesCollection.document(entry.id))
+                if (pointerRef != null) batch.set(pointerRef, pointerPayload)
+                awaitServerOrQueueOffline(batch.commit(), OperationType.WRITE, path)
+            }
+            Result.success(archiveId)
         } catch (e: CancellationException) {
             throw e
+        } catch (e: ConcurrentLedgerEditException) {
+            Result.failure(e)
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.WRITE, "ledgers/$ledgerOwnerUid/archives")
+            handleFirestoreError(e, OperationType.WRITE, path)
             Result.failure(e)
         }
     }
@@ -802,18 +918,69 @@ class LedgerRepository(
         workspaceAdminUid: String
     ): Flow<List<LedgerArchive>> {
         val path = "ledgers/$ledgerOwnerUid/archives"
-        return db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("archives")
+        return ledgerCollection(ledgerOwnerUid, LedgerArchive.COLLECTION_ARCHIVES)
             .whereEqualTo("ledgerOwnerUid", ledgerOwnerUid)
             .whereEqualTo("workspaceAdminUid", workspaceAdminUid)
             .snapshots(MetadataChanges.INCLUDE)
             .map { snapshot ->
                 snapshot.documents
-                    .filter { it.id != SUBMITTED_CURRENT_DOC_ID }
-                    .mapNotNull { doc ->
-                        doc.toLedgerArchiveOrNull()
-                    }
+                    .filter { it.id != LedgerArchive.LEGACY_SUBMITTED_DOC_ID }
+                    .mapNotNull { doc -> doc.toLedgerArchiveOrNull(LedgerArchive.COLLECTION_ARCHIVES) }
+                    .sortedWith(compareBy<LedgerArchive> { it.isVoided }.thenByDescending { it.createdAt ?: Timestamp(0, 0) })
+            }
+            .catch { error ->
+                if (error is Exception) handleFirestoreError(error, OperationType.LIST, path)
+                throw error
+            }
+    }
+
+    /**
+     * The report the seller most recently sent. Follows the pointer document; before the first
+     * report under this version it falls back to the legacy `submitted_current` document, and after
+     * a new cycle starts (empty pointer) there is no current report.
+     */
+    fun observeLatestSubmission(
+        ledgerOwnerUid: String,
+        workspaceAdminUid: String
+    ): Flow<LedgerArchive?> {
+        val pointerPath = "ledgers/$ledgerOwnerUid/pointers/$LATEST_SUBMISSION_POINTER_ID"
+        return ledgerCollection(ledgerOwnerUid, "pointers")
+            .document(LATEST_SUBMISSION_POINTER_ID)
+            .snapshots(MetadataChanges.INCLUDE)
+            .flatMapLatest { pointer ->
+                val submissionId = pointer.getString("submissionId")
+                when {
+                    !pointer.exists() -> ledgerCollection(ledgerOwnerUid, LedgerArchive.COLLECTION_ARCHIVES)
+                        .document(LedgerArchive.LEGACY_SUBMITTED_DOC_ID)
+                        .snapshots(MetadataChanges.INCLUDE)
+                        .map { it.toLedgerArchiveOrNull(LedgerArchive.COLLECTION_ARCHIVES) }
+                    submissionId.isNullOrBlank() -> flowOf(null)
+                    else -> ledgerCollection(ledgerOwnerUid, LedgerArchive.COLLECTION_SUBMISSIONS)
+                        .document(submissionId)
+                        .snapshots(MetadataChanges.INCLUDE)
+                        .map { it.toLedgerArchiveOrNull(LedgerArchive.COLLECTION_SUBMISSIONS) }
+                }
+            }
+            .map { report -> report?.takeIf { it.workspaceAdminUid.isBlank() || it.workspaceAdminUid == workspaceAdminUid } }
+            .catch { error ->
+                if (error is Exception) handleFirestoreError(error, OperationType.GET, pointerPath)
+                throw error
+            }
+    }
+
+    /** Every report this seller has sent, newest first. */
+    fun observeSubmissionHistory(
+        ledgerOwnerUid: String,
+        workspaceAdminUid: String
+    ): Flow<List<LedgerArchive>> {
+        val path = "ledgers/$ledgerOwnerUid/submissions"
+        return ledgerCollection(ledgerOwnerUid, LedgerArchive.COLLECTION_SUBMISSIONS)
+            .whereEqualTo("ledgerOwnerUid", ledgerOwnerUid)
+            .whereEqualTo("workspaceAdminUid", workspaceAdminUid)
+            .snapshots(MetadataChanges.INCLUDE)
+            .map { snapshot ->
+                snapshot.documents
+                    .mapNotNull { it.toLedgerArchiveOrNull(LedgerArchive.COLLECTION_SUBMISSIONS) }
                     .sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
             }
             .catch { error ->
@@ -822,115 +989,102 @@ class LedgerRepository(
             }
     }
 
-    fun observeSubmittedSellerList(
-        ledgerOwnerUid: String,
-        workspaceAdminUid: String
-    ): Flow<LedgerArchive?> {
-        val path = "ledgers/$ledgerOwnerUid/archives/$SUBMITTED_CURRENT_DOC_ID"
-        return db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("archives")
-            .document(SUBMITTED_CURRENT_DOC_ID)
-            .snapshots(MetadataChanges.INCLUDE)
-            .map { snapshot ->
-                snapshot.toLedgerArchiveOrNull()
-            }
-            .catch { error ->
-                if (error is Exception) handleFirestoreError(error, OperationType.GET, path)
-                throw error
-            }
-    }
-
+    /**
+     * OFF-04 / DATA-01: Freezes the working list as a new, uniquely identified report and points the
+     * Admin view at it, in one atomic batch. Earlier reports are never overwritten. Pass the same
+     * [submissionId] when retrying so a retry cannot create a duplicate.
+     */
     suspend fun submitCurrentListToAdmin(
         ledgerOwnerUid: String,
         workspaceAdminUid: String,
         ownerName: String,
         activeEntries: List<SaleEntry>,
         costPerGbToman: Long = 1_000L,
-        adminProfitPercent: Int = 50
+        adminProfitPercent: Int = 50,
+        settingsRevision: Long = 1L,
+        submissionId: String = newSubmissionId()
     ): Result<WriteAckStatus> {
-        requireUserId()
         if (activeEntries.size > MAX_ARCHIVE_ITEMS) {
-            return Result.failure(
-                IllegalArgumentException(
-                    "Current list has ${activeEntries.size} sales, exceeding the $MAX_ARCHIVE_ITEMS-record snapshot limit."
+            return Result.failure(tooManyEntries(activeEntries.size))
+        }
+        val submissionRef = ledgerCollection(ledgerOwnerUid, LedgerArchive.COLLECTION_SUBMISSIONS).document(submissionId)
+        return try {
+            requireUserId()
+            val payload = buildSnapshotPayload(
+                ledgerOwnerUid, workspaceAdminUid, ownerName, "Sales report", activeEntries,
+                costPerGbToman, adminProfitPercent, settingsRevision
+            )
+            val batch = db.batch()
+            batch.set(submissionRef, payload)
+            batch.set(
+                ledgerCollection(ledgerOwnerUid, "pointers").document(LATEST_SUBMISSION_POINTER_ID),
+                mapOf(
+                    "ledgerOwnerUid" to ledgerOwnerUid,
+                    "workspaceAdminUid" to workspaceAdminUid,
+                    "submissionId" to submissionId,
+                    "updatedAt" to FieldValue.serverTimestamp()
                 )
             )
-        }
-        val archivesCol = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("archives")
-        val currentPointerRef = archivesCol.document(SUBMITTED_CURRENT_DOC_ID)
-
-        val totalSales = activeEntries.sumOf { it.safePriceToman }
-        val paidSales = activeEntries.filter { it.isPaid }.sumOf { it.safePriceToman }
-        val unpaidSales = (totalSales - paidSales).coerceAtLeast(0L)
-        val totalGb = activeEntries.sumOf { it.safeDataGb }
-        val itemsList = activeEntries.mapIndexed { idx, entry -> entry.toArchiveItemMap(idx) }
-        val paidMap = itemsList.associate { item ->
-            (item["itemId"] as String) to (item["isPaid"] as Boolean)
-        }
-        val cleanOwnerName = TomanFormatter.sanitizeOwnerDisplayName(ownerName).take(100)
-
-        val payload = mapOf(
-            "ledgerOwnerUid" to ledgerOwnerUid,
-            "workspaceAdminUid" to workspaceAdminUid,
-            "ownerName" to cleanOwnerName.ifBlank { "Seller" },
-            "cycleTitle" to "Current Sent List",
-            "totalSalesToman" to totalSales,
-            "paidToman" to paidSales,
-            "unpaidToman" to unpaidSales,
-            "totalGb" to totalGb,
-            "costPerGbToman" to costPerGbToman.coerceAtLeast(0L),
-            "adminProfitPercent" to adminProfitPercent.coerceIn(0, 100),
-            "entryCount" to itemsList.size,
-            "items" to itemsList,
-            "paidMap" to paidMap,
-            "createdAt" to FieldValue.serverTimestamp()
-        )
-
-        return try {
-            val status = awaitServerOrQueueOffline(
-                currentPointerRef.set(payload),
-                OperationType.WRITE,
-                currentPointerRef.path
-            )
+            val status = awaitServerOrQueueOffline(batch.commit(), OperationType.WRITE, submissionRef.path)
             Result.success(status)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.WRITE, currentPointerRef.path)
+            handleFirestoreError(e, OperationType.WRITE, submissionRef.path)
             Result.failure(e)
         }
     }
 
-    suspend fun updateArchiveItemsPaidStatus(
+    /** DATA-03: Changes exactly one item's customer-payment checkbox in a frozen snapshot. */
+    suspend fun updateSnapshotItemPaidStatus(
+        ledgerOwnerUid: String,
+        collection: String,
+        snapshotId: String,
+        itemId: String,
+        isPaid: Boolean
+    ): Result<Unit> {
+        val docRef = ledgerCollection(ledgerOwnerUid, collection).document(snapshotId)
+        return try {
+            requireUserId()
+            require(collection == LedgerArchive.COLLECTION_ARCHIVES || collection == LedgerArchive.COLLECTION_SUBMISSIONS)
+            require(snapshotId != LedgerArchive.LEGACY_SUBMITTED_DOC_ID) { "This older report is read-only." }
+            require(itemId.isNotBlank()) { "This sale has no id and cannot be updated." }
+            awaitServerOrQueueOffline(
+                docRef.update(
+                    FieldPath.of("paidMap", itemId), isPaid,
+                    "updatedAt", FieldValue.serverTimestamp()
+                ),
+                OperationType.UPDATE,
+                docRef.path
+            )
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+            Result.failure(e)
+        }
+    }
+
+    /** DATA-03: Archives are voided with a reason instead of deleted; the record is kept. */
+    suspend fun voidArchive(
         ledgerOwnerUid: String,
         archiveId: String,
-        updatedItems: List<ArchivedSaleItem>
+        reason: String
     ): Result<Unit> {
-        requireUserId()
-        val docRef = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("archives")
-            .document(archiveId)
-
-        val paidSales = updatedItems.filter { it.isPaid }.sumOf { it.priceToman.coerceAtLeast(0L) }
-        val totalSales = updatedItems.sumOf { it.priceToman.coerceAtLeast(0L) }
-        val unpaidSales = (totalSales - paidSales).coerceAtLeast(0L)
-        val serializedItems = updatedItems.mapIndexed { idx, item -> item.toMap(idx) }
-        val paidMap = serializedItems.associate { item ->
-            (item["itemId"] as String) to (item["isPaid"] as Boolean)
-        }
-
+        val docRef = ledgerCollection(ledgerOwnerUid, LedgerArchive.COLLECTION_ARCHIVES).document(archiveId)
+        val cleanReason = reason.trim().take(300)
         return try {
+            val uid = requireUserId()
+            require(cleanReason.length >= 3) { "Enter a reason of at least 3 characters." }
             awaitServerOrQueueOffline(
                 docRef.update(
                     mapOf(
-                        "paidToman" to paidSales,
-                        "unpaidToman" to unpaidSales,
-                        "items" to serializedItems,
-                        "paidMap" to paidMap
+                        "voided" to true,
+                        "voidReason" to cleanReason,
+                        "voidedBy" to uid,
+                        "voidedAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp()
                     )
                 ),
                 OperationType.UPDATE,
@@ -945,32 +1099,48 @@ class LedgerRepository(
         }
     }
 
-    suspend fun deleteArchive(
+    /** Admin marks a received report as settled (or reopens it). */
+    suspend fun setSubmissionSettled(
         ledgerOwnerUid: String,
-        archiveId: String
+        submissionId: String,
+        settled: Boolean
     ): Result<Unit> {
-        requireUserId()
-        val docRef = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("archives")
-            .document(archiveId)
-
+        val docRef = ledgerCollection(ledgerOwnerUid, LedgerArchive.COLLECTION_SUBMISSIONS).document(submissionId)
         return try {
-            awaitServerOrQueueOffline(docRef.delete(), OperationType.DELETE, docRef.path)
+            requireUserId()
+            awaitServerOrQueueOffline(
+                docRef.update(
+                    mapOf(
+                        "adminStatus" to if (settled) LedgerArchive.ADMIN_STATUS_SETTLED else LedgerArchive.ADMIN_STATUS_RECEIVED,
+                        "adminStatusUpdatedAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ),
+                OperationType.UPDATE,
+                docRef.path
+            )
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, docRef.path)
+            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
             Result.failure(e)
         }
     }
 
     companion object {
-        const val SUBMITTED_CURRENT_DOC_ID = "submitted_current"
         const val MAX_ARCHIVE_ITEMS = 500
+        const val LATEST_SUBMISSION_POINTER_ID = "latest_submission"
+        private const val SNAPSHOT_SCHEMA_VERSION = 2
         private const val SERVER_ACK_WAIT_MS = 2_500L
         private const val BOOTSTRAP_NET_TIMEOUT_MS = 4_000L
+        private const val TRANSACTION_TIMEOUT_MS = 10_000L
+
+        private fun randomSuffix(length: Int) = UUID.randomUUID().toString().replace("-", "").take(length)
+
+        fun newSaleId(): String = "sale_${randomSuffix(20)}"
+        fun newArchiveId(): String = "arch_${randomSuffix(20)}"
+        fun newSubmissionId(): String = "sub_${System.currentTimeMillis()}_${randomSuffix(8)}"
     }
 
     // --- 5. Custom Data Volume (GB), New User Bonus GB & Toman Presets ---
@@ -980,9 +1150,7 @@ class LedgerRepository(
         workspaceAdminUid: String
     ): Flow<List<DataPreset>> {
         val path = "ledgers/$ledgerOwnerUid/presets"
-        return db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("presets")
+        return ledgerCollection(ledgerOwnerUid, "presets")
             .whereEqualTo("ledgerOwnerUid", ledgerOwnerUid)
             .whereEqualTo("workspaceAdminUid", workspaceAdminUid)
             .snapshots(MetadataChanges.INCLUDE)
@@ -1006,7 +1174,6 @@ class LedgerRepository(
         defaultPriceToman: Long,
         newUserBonusGb: Double = 0.0
     ): Result<String> {
-        requireUserId()
         if (!dataGb.isFinite() || dataGb <= 0.0 || dataGb > SaleEntry.MAX_ALLOWED_GB) {
             return Result.failure(IllegalArgumentException("Preset GB must be between 0.1 and 100,000 GB."))
         }
@@ -1014,16 +1181,14 @@ class LedgerRepository(
             return Result.failure(IllegalArgumentException("Preset price is out of valid Toman range."))
         }
         val presetId = existingPresetId?.takeIf { it.isNotBlank() }
-            ?: "preset_${UUID.randomUUID().toString().replace("-", "").take(16)}"
-        val docRef = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("presets")
-            .document(presetId)
+            ?: "preset_${randomSuffix(16)}"
+        val docRef = ledgerCollection(ledgerOwnerUid, "presets").document(presetId)
 
         val cleanLabel = label.trim().take(80)
         val cleanBonusGb = if (newUserBonusGb.isFinite()) newUserBonusGb.coerceIn(0.0, SaleEntry.MAX_ALLOWED_GB) else 0.0
 
         return try {
+            requireUserId()
             val existingSnap = docRef.get().await()
             if (existingSnap.exists()) {
                 docRef.update(
@@ -1080,13 +1245,10 @@ class LedgerRepository(
         ledgerOwnerUid: String,
         presetId: String
     ): Result<Unit> {
-        requireUserId()
-        val docRef = db.collection("ledgers")
-            .document(ledgerOwnerUid)
-            .collection("presets")
-            .document(presetId)
+        val docRef = ledgerCollection(ledgerOwnerUid, "presets").document(presetId)
 
         return try {
+            requireUserId()
             docRef.delete().await()
             Result.success(Unit)
         } catch (e: CancellationException) {

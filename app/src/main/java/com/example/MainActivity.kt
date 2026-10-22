@@ -30,7 +30,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.credentials.CredentialManager
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material3.OutlinedButton
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -61,25 +66,63 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/**
+ * REL-01: Holds the ViewModelStore of the signed-in session. It survives rotation (it is an
+ * activity-scoped ViewModel) but is cleared as soon as the account changes or signs out, so an old
+ * session's Firestore listeners never keep running in the background.
+ */
+class SessionStoreHolder : ViewModel() {
+    private var sessionKey: String? = null
+    private var store = ViewModelStore()
+
+    fun ownerFor(key: String): ViewModelStoreOwner {
+        if (key != sessionKey) {
+            store.clear()
+            store = ViewModelStore()
+            sessionKey = key
+        }
+        val current = store
+        return object : ViewModelStoreOwner {
+            override val viewModelStore: ViewModelStore = current
+        }
+    }
+
+    fun endSession() {
+        store.clear()
+        store = ViewModelStore()
+        sessionKey = null
+    }
+
+    override fun onCleared() {
+        store.clear()
+    }
+}
+
 @Composable
 fun VeloLedgerAppRoot(auth: FirebaseAuth = Firebase.auth) {
     val currentUser by auth.authStateFlow().collectAsStateWithLifecycle(initialValue = auth.currentUser)
     val user = currentUser
     var signOutEpoch by rememberSaveable { mutableIntStateOf(0) }
+    val sessionStores: SessionStoreHolder = viewModel()
 
     if (user == null) {
+        LaunchedEffect(Unit) { sessionStores.endSession() }
         AuthGateScreen(
             onAuthSuccess = {
                 // Auth state flow will emit the authenticated user automatically
             }
         )
     } else {
+        val sessionOwner = remember(user.uid, signOutEpoch) {
+            sessionStores.ownerFor("${user.uid}_$signOutEpoch")
+        }
         AuthenticatedSessionContent(
+            sessionOwner = sessionOwner,
             currentUserId = user.uid,
             currentUserEmail = user.email ?: "",
             currentUserDisplayName = user.displayName ?: "",
-            sessionEpoch = signOutEpoch,
             onSignedOut = {
+                sessionStores.endSession()
                 signOutEpoch++
             }
         )
@@ -88,10 +131,10 @@ fun VeloLedgerAppRoot(auth: FirebaseAuth = Firebase.auth) {
 
 @Composable
 private fun AuthenticatedSessionContent(
+    sessionOwner: ViewModelStoreOwner,
     currentUserId: String,
     currentUserEmail: String,
     currentUserDisplayName: String,
-    sessionEpoch: Int,
     onSignedOut: () -> Unit
 ) {
     val context = LocalContext.current
@@ -99,7 +142,8 @@ private fun AuthenticatedSessionContent(
     val credentialManager = remember(context) { CredentialManager.create(context) }
 
     val viewModel: LedgerViewModel = viewModel(
-        key = "${currentUserId}_session_${sessionEpoch}",
+        viewModelStoreOwner = sessionOwner,
+        key = "ledger_$currentUserId",
         factory = viewModelFactory {
             initializer {
                 val app = checkNotNull(this[APPLICATION_KEY]) {
@@ -134,13 +178,25 @@ private fun AuthenticatedSessionContent(
                         CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.height(14.dp))
                         Text(
-                            text = "Syncing NodeSplit Cloud Workspace...",
+                            text = "Loading your workspace…",
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onBackground
                         )
                     }
                 }
             }
+        }
+
+        is WorkspaceSessionState.NotConfigured -> {
+            WorkspaceNotConfiguredScreen(
+                signedInUid = state.signedInUid,
+                onRetry = viewModel::initializeWorkspaceAndProfile,
+                onSignOut = {
+                    signOutUser(credentialManager, scope) {
+                        onSignedOut()
+                    }
+                }
+            )
         }
 
         is WorkspaceSessionState.Error -> {
@@ -156,7 +212,7 @@ private fun AuthenticatedSessionContent(
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = "Unable to Load Ledger Workspace",
+                        text = "Couldn't load your workspace",
                         style = MaterialTheme.typography.headlineMedium,
                         color = MaterialTheme.colorScheme.error
                     )
@@ -169,7 +225,7 @@ private fun AuthenticatedSessionContent(
                     )
                     Spacer(modifier = Modifier.height(18.dp))
                     Button(onClick = viewModel::initializeWorkspaceAndProfile) {
-                        Text("Retry Connection")
+                        Text("Try again")
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(
@@ -207,6 +263,66 @@ private fun AuthenticatedSessionContent(
                         }
                     }
                 )
+            }
+        }
+    }
+}
+
+/**
+ * SEC-04: Shown when config/workspace does not exist. The owner creates it once in the Firebase
+ * console with their own UID (shown here), so no stranger can claim a fresh workspace.
+ */
+@Composable
+private fun WorkspaceNotConfiguredScreen(
+    signedInUid: String,
+    onRetry: () -> Unit,
+    onSignOut: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "Workspace not set up yet",
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = "If you are the owner, create the document config/workspace in the Firebase console and set adminUid to the ID below. Then tap Try again. If you are a seller, ask the owner to finish setup.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+            Text(
+                text = "Your user ID",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            SelectionContainer {
+                Text(
+                    text = signedInUid,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    textAlign = TextAlign.Center
+                )
+            }
+            Spacer(modifier = Modifier.height(18.dp))
+            Button(onClick = onRetry) {
+                Text("Try again")
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(onClick = onSignOut) {
+                Text("Sign out")
             }
         }
     }

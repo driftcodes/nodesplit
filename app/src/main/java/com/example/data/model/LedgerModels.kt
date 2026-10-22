@@ -11,6 +11,7 @@ import java.math.RoundingMode
 import java.security.MessageDigest
 import java.text.NumberFormat
 import java.util.Locale
+import kotlin.math.abs
 
 @IgnoreExtraProperties
 data class WorkspaceConfig(
@@ -233,6 +234,11 @@ data class ArchivedSaleItem(
     }
 }
 
+/**
+ * A frozen snapshot: either a closed cycle (`archives/`) or a report the seller sent to the Admin
+ * (`submissions/`). Items, totals and captured rates never change after creation; only the
+ * per-item [paidMap], a one-way void and (for reports) the Admin's settlement status can.
+ */
 @IgnoreExtraProperties
 data class LedgerArchive(
     @DocumentId val id: String = "",
@@ -253,10 +259,25 @@ data class LedgerArchive(
     val paidMap: Map<String, Boolean> = emptyMap(),
     val hasPendingSync: Boolean = false,
     val malformedItemCount: Int = 0,
+    val sourceCollection: String = COLLECTION_ARCHIVES,
+    val isVoided: Boolean = false,
+    val voidReason: String = "",
+    val voidedAt: Timestamp? = null,
+    val adminStatus: String = "",
     @ServerTimestamp val createdAt: Timestamp? = null
 ) {
     // Alias for backward compatibility in tests/callers
     val totalDataGb: Double get() = totalGb
+
+    val isSubmission: Boolean
+        get() = sourceCollection == COLLECTION_SUBMISSIONS
+
+    /** The pre-2.0 overwrite-only report document (`archives/submitted_current`). */
+    val isLegacyReport: Boolean
+        get() = sourceCollection == COLLECTION_ARCHIVES && id == LEGACY_SUBMITTED_DOC_ID
+
+    val isSettled: Boolean
+        get() = adminStatus == ADMIN_STATUS_SETTLED
 
     fun parsedItems(): List<ArchivedSaleItem> =
         items.mapIndexedNotNull { idx, raw -> ArchivedSaleItem.fromMap(raw, idx, paidMap) }
@@ -283,6 +304,14 @@ data class LedgerArchive(
             effectiveCostPerGbToman = effectiveCostPerGb,
             effectiveAdminProfitPercent = effectiveAdminPct
         )
+    }
+
+    companion object {
+        const val COLLECTION_ARCHIVES = "archives"
+        const val COLLECTION_SUBMISSIONS = "submissions"
+        const val LEGACY_SUBMITTED_DOC_ID = "submitted_current"
+        const val ADMIN_STATUS_RECEIVED = "RECEIVED"
+        const val ADMIN_STATUS_SETTLED = "SETTLED"
     }
 }
 
@@ -346,38 +375,41 @@ object FinancialCalculator {
         )
     }
 
+    /**
+     * SEC-05: Totals are re-derived from the validated items rather than trusted from the stored
+     * summary fields. A disagreement (or skipped malformed items) is flagged for the UI.
+     */
     fun computeArchiveMetrics(
         archive: LedgerArchive,
         parsedItems: List<ArchivedSaleItem>,
         effectiveCostPerGbToman: Long,
         effectiveAdminProfitPercent: Int
     ): LedgerSummaryMetrics {
-        val safeTotalGb = if (archive.totalGb.isFinite() && archive.totalGb >= 0.0) {
-            archive.totalGb
-        } else {
-            parsedItems.sumOf { it.safeDataGb }
+        val derivedGross = parsedItems.fold(0L) { acc, item ->
+            (acc + item.priceToman.coerceIn(0L, SaleEntry.MAX_ALLOWED_TOMAN)).coerceAtMost(Long.MAX_VALUE / 2)
         }
-        val safeGross = if (archive.totalSalesToman >= 0L) {
-            archive.totalSalesToman
-        } else {
-            parsedItems.sumOf { it.priceToman.coerceAtLeast(0L) }
-        }
+        val derivedGb = parsedItems.sumOf { it.safeDataGb }
         val paidSum = parsedItems.filter { it.isPaid }.sumOf { it.priceToman.coerceAtLeast(0L) }
-        val unpaidSum = (safeGross - paidSum).coerceAtLeast(0L)
+        val unpaidSum = (derivedGross - paidSum).coerceAtLeast(0L)
+        val totalsMismatch = archive.malformedItemCount > 0 ||
+            archive.totalSalesToman != derivedGross ||
+            abs(archive.totalGb - derivedGb) > 0.001 ||
+            archive.entryCount != parsedItems.size
 
         return LedgerSummaryMetrics(
-            totalSalesToman = safeGross,
+            totalSalesToman = derivedGross,
             paidToman = paidSum,
             unpaidToman = unpaidSum,
-            totalGb = safeTotalGb,
+            totalGb = derivedGb,
             totalBonusGb = parsedItems.sumOf { it.safeBonusGb },
             newUsersCount = parsedItems.count { it.isNewUser },
-            totalCustomers = archive.entryCount.coerceAtLeast(parsedItems.size),
+            totalCustomers = parsedItems.size,
             paidCount = parsedItems.count { it.isPaid },
             unpaidCount = parsedItems.count { !it.isPaid },
             costPerGbToman = effectiveCostPerGbToman.coerceIn(0L, 1_000_000_000L),
             adminProfitPercent = effectiveAdminProfitPercent.coerceIn(0, 100),
-            hasLegacyAssumedRates = !archive.hasCapturedCostPerGb || !archive.hasCapturedAdminPercent
+            hasLegacyAssumedRates = !archive.hasCapturedCostPerGb || !archive.hasCapturedAdminPercent,
+            hasTotalsMismatch = totalsMismatch
         )
     }
 
@@ -529,7 +561,9 @@ fun DocumentSnapshot.toSaleEntryOrNull(): SaleEntry? {
 }
 
 @Suppress("UNCHECKED_CAST")
-fun DocumentSnapshot.toLedgerArchiveOrNull(): LedgerArchive? {
+fun DocumentSnapshot.toLedgerArchiveOrNull(
+    sourceCollection: String = LedgerArchive.COLLECTION_ARCHIVES
+): LedgerArchive? {
     if (!exists()) return null
     val behavior = DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
     val rawList = (get("items") as? List<*>) ?: emptyList<Any?>()
@@ -573,6 +607,11 @@ fun DocumentSnapshot.toLedgerArchiveOrNull(): LedgerArchive? {
         paidMap = rawPaidMap,
         hasPendingSync = metadata.hasPendingWrites(),
         malformedItemCount = malformedCount,
+        sourceCollection = sourceCollection,
+        isVoided = getBoolean("voided") ?: false,
+        voidReason = getString("voidReason") ?: "",
+        voidedAt = try { getTimestamp("voidedAt", behavior) } catch (_: Exception) { null },
+        adminStatus = getString("adminStatus") ?: "",
         createdAt = try { getTimestamp("createdAt", behavior) } catch (_: Exception) { null }
     )
 }
@@ -608,7 +647,8 @@ data class LedgerSummaryMetrics(
     val unpaidCount: Int = 0,
     val costPerGbToman: Long = 1_000L,
     val adminProfitPercent: Int = 50,
-    val hasLegacyAssumedRates: Boolean = false
+    val hasLegacyAssumedRates: Boolean = false,
+    val hasTotalsMismatch: Boolean = false
 ) {
     val salesCount: Int
         get() = totalCustomers
@@ -635,12 +675,6 @@ data class LedgerSummaryMetrics(
     // 5. Total Contractual Amount Seller Must Pay Admin = Admin Profit + Infrastructure Cost
     val sellerPayableToAdminToman: Long
         get() = adminProfitToman + infraCostToman
-}
-
-enum class PaymentFilter(val label: String) {
-    ALL("All Sales"),
-    UNPAID("Unpaid Only"),
-    PAID("Paid Only")
 }
 
 data class LedgerTargetBook(
@@ -816,14 +850,24 @@ object TomanFormatter {
         return beforeAt.ifBlank { "NodeSplit Account" }
     }
 
-    /**
-     * Canonicalizes an email address and produces a deterministic, collision-resistant Firestore document ID.
-     * Appends a short SHA-256 hex digest when non-alphanumeric characters or long emails could otherwise collide.
-     */
     fun canonicalizeEmail(email: String): String {
         return email.trim().lowercase(Locale.US)
     }
 
+    private val invitationKeyPattern = Regex("^[a-z0-9._%+\\-]+@[a-z0-9.\\-]+$")
+
+    /**
+     * SEC-02: Invitations are keyed by the canonical email itself, so two different addresses can
+     * never share a document (the old `a.b@x` / `a_dot_b@x` collision). The Firestore rules let a
+     * non-admin read only the key equal to their own signed-in token email.
+     * Returns null for an address that cannot be used as a key (it must be added differently).
+     */
+    fun invitationKeyFor(email: String): String? {
+        val canonical = canonicalizeEmail(email)
+        return canonical.takeIf { it.length in 3..200 && invitationKeyPattern.matches(it) }
+    }
+
+    /** Pre-2.0 invitation key (`a_at_b_dot_c`). Read only for migration; collision-prone. */
     fun legacyEmailToSafeKey(email: String): String {
         val cleaned = canonicalizeEmail(email)
             .replace("@", "_at_")
@@ -832,7 +876,8 @@ object TomanFormatter {
         return cleaned.take(120).ifBlank { "unknown_email" }
     }
 
-    fun emailToSafeKey(email: String): String {
+    /** Interim key scheme (legacy key plus a hash suffix for unusual addresses). Read only for migration. */
+    fun interimEmailToSafeKey(email: String): String {
         val canonical = canonicalizeEmail(email)
         if (canonical.isBlank()) return "unknown_email"
         val readable = canonical
@@ -844,10 +889,13 @@ object TomanFormatter {
         return if (!hasSpecialChars && canonical.length <= 80) {
             readable.ifBlank { "unknown_email" }
         } else {
-            val hashSuffix = sha256Hex(canonical).take(12)
-            "${readable}_$hashSuffix"
+            "${readable}_${sha256Hex(canonical).take(12)}"
         }
     }
+
+    /** Every key an invitation for [email] may be stored under, newest scheme first. */
+    fun candidateInvitationKeys(email: String): List<String> =
+        listOfNotNull(invitationKeyFor(email), interimEmailToSafeKey(email), legacyEmailToSafeKey(email)).distinct()
 
     private fun sha256Hex(input: String): String {
         return try {

@@ -108,7 +108,7 @@ object GraphicalPdfExporter {
 
         return PdfReportPayload(
             reportTitle = TomanFormatter.sanitizeOwnerDisplayName(bookTitle),
-            subtitle = "Active VPN Sales & Settlement Statement",
+            subtitle = "Active cycle statement",
             ownerName = TomanFormatter.sanitizeOwnerDisplayName(ownerName),
             isArchivedSnapshot = false,
             isPrivateAdminBook = isPrivateAdminBook,
@@ -163,8 +163,16 @@ object GraphicalPdfExporter {
         )
 
         return PdfReportPayload(
-            reportTitle = archive.cycleTitle.ifBlank { "Archived Cycle" },
-            subtitle = "Archived VPN Ledger Snapshot • Closed ${dateFormat.format(archiveDate)}",
+            reportTitle = if (archive.isSubmission || archive.isLegacyReport) {
+                "Sales report"
+            } else {
+                archive.cycleTitle.ifBlank { "Archived cycle" }
+            },
+            subtitle = when {
+                archive.isVoided -> "VOIDED archive • Closed ${dateFormat.format(archiveDate)}"
+                archive.isSubmission || archive.isLegacyReport -> "Report sent to Admin • Uploaded ${dateFormat.format(archiveDate)}"
+                else -> "Closed cycle • Closed ${dateFormat.format(archiveDate)}"
+            },
             ownerName = TomanFormatter.sanitizeOwnerDisplayName(archive.ownerName),
             isArchivedSnapshot = true,
             isPrivateAdminBook = isPrivateAdminBook,
@@ -486,8 +494,8 @@ object GraphicalPdfExporter {
                 top = currentY,
                 width = cardWidth,
                 height = cardHeight,
-                label = "PROFIT SPLIT RULE",
-                value = "Admin ${payload.adminProfitPercent}% / Seller ${payload.sellerProfitPercent}%",
+                label = "PROFIT SPLIT",
+                value = "Seller ${payload.sellerProfitPercent}% / Admin ${payload.adminProfitPercent}%",
                 subValue = "Net Profit: ${TomanFormatter.format(payload.netProfitToman)}",
                 accentColor = Color.parseColor("#0F172A"),
                 bgColor = Color.WHITE
@@ -505,56 +513,67 @@ object GraphicalPdfExporter {
                 top = currentY,
                 width = splitCardWidth,
                 height = splitCardHeight,
-                label = "1. INFRASTRUCTURE COST",
+                label = "INFRASTRUCTURE COST",
                 value = TomanFormatter.format(payload.infraCostToman),
                 subValue = "${TomanFormatter.formatGb(payload.totalGb)} × ${TomanFormatter.format(payload.costPerGbToman)}",
                 accentColor = Color.parseColor("#D97706"),
                 bgColor = Color.parseColor("#FFFBEB")
             )
 
-            drawKpiCard(
-                canvas = canvas,
-                left = MARGIN + (splitCardWidth + cardSpacing) * 1,
-                top = currentY,
-                width = splitCardWidth,
-                height = splitCardHeight,
-                label = "2. SELLER PROFIT (${payload.sellerProfitPercent}%)",
-                value = TomanFormatter.format(payload.sellerProfitToman),
-                subValue = "Seller Net Share",
-                accentColor = Color.parseColor("#0284C7"),
-                bgColor = Color.parseColor("#F0F9FF")
-            )
-
-            drawKpiCard(
-                canvas = canvas,
-                left = MARGIN + (splitCardWidth + cardSpacing) * 2,
-                top = currentY,
-                width = splitCardWidth,
-                height = splitCardHeight,
-                label = "3. ADMIN PROFIT (${payload.adminProfitPercent}%)",
-                value = TomanFormatter.format(payload.adminProfitToman),
-                subValue = "Admin Net Share",
-                accentColor = Color.parseColor("#4F46E5"),
-                bgColor = Color.parseColor("#EEF2FF")
-            )
-
-            val settlementLabel = if (payload.isPrivateAdminBook) {
-                "ADMIN INFRA + SHARE"
+            if (payload.isPrivateAdminBook) {
+                // The Admin's own book: no transfer to oneself, just the business profit.
+                drawKpiCard(
+                    canvas = canvas,
+                    left = MARGIN + (splitCardWidth + cardSpacing) * 1,
+                    top = currentY,
+                    width = splitCardWidth * 3 + cardSpacing * 2,
+                    height = splitCardHeight,
+                    label = "BUSINESS PROFIT",
+                    value = TomanFormatter.format(payload.netProfitToman),
+                    subValue = "Gross sales minus infrastructure cost, before other expenses",
+                    accentColor = Color.parseColor("#047857"),
+                    bgColor = Color.parseColor("#D1FAE5")
+                )
             } else {
-                "AMOUNT SELLER PAYS ADMIN"
+                drawKpiCard(
+                    canvas = canvas,
+                    left = MARGIN + (splitCardWidth + cardSpacing) * 1,
+                    top = currentY,
+                    width = splitCardWidth,
+                    height = splitCardHeight,
+                    label = "SELLER PROFIT (${payload.sellerProfitPercent}%)",
+                    value = TomanFormatter.format(payload.sellerProfitToman),
+                    subValue = "Seller share",
+                    accentColor = Color.parseColor("#0284C7"),
+                    bgColor = Color.parseColor("#F0F9FF")
+                )
+
+                drawKpiCard(
+                    canvas = canvas,
+                    left = MARGIN + (splitCardWidth + cardSpacing) * 2,
+                    top = currentY,
+                    width = splitCardWidth,
+                    height = splitCardHeight,
+                    label = "ADMIN PROFIT (${payload.adminProfitPercent}%)",
+                    value = TomanFormatter.format(payload.adminProfitToman),
+                    subValue = "Admin share",
+                    accentColor = Color.parseColor("#4F46E5"),
+                    bgColor = Color.parseColor("#EEF2FF")
+                )
+
+                drawKpiCard(
+                    canvas = canvas,
+                    left = MARGIN + (splitCardWidth + cardSpacing) * 3,
+                    top = currentY,
+                    width = splitCardWidth,
+                    height = splitCardHeight,
+                    label = "AMOUNT DUE TO ADMIN",
+                    value = TomanFormatter.format(payload.sellerPayableToAdminToman),
+                    subValue = "Infrastructure + admin profit",
+                    accentColor = Color.parseColor("#047857"),
+                    bgColor = Color.parseColor("#D1FAE5")
+                )
             }
-            drawKpiCard(
-                canvas = canvas,
-                left = MARGIN + (splitCardWidth + cardSpacing) * 3,
-                top = currentY,
-                width = splitCardWidth,
-                height = splitCardHeight,
-                label = settlementLabel,
-                value = TomanFormatter.format(payload.sellerPayableToAdminToman),
-                subValue = "Admin Profit + Infra Cost",
-                accentColor = Color.parseColor("#047857"),
-                bgColor = Color.parseColor("#D1FAE5")
-            )
 
             currentY += splitCardHeight + 14f
         } else {
@@ -682,7 +701,7 @@ object GraphicalPdfExporter {
         }
         val footerY = PAGE_HEIGHT - 16f
         canvas.drawText(
-            "NodeSplit VPN Bookkeeping Statement  •  All prices in Iranian Toman",
+            "NodeSplit statement  •  All amounts in Toman",
             MARGIN,
             footerY,
             footerPaint
@@ -735,11 +754,18 @@ object GraphicalPdfExporter {
             textSize = 10f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         }
-        if (valuePaint.measureText(value) > innerWidth) {
-            valuePaint.textSize = 8.5f
+        // PDF-02: An amount is never cut. Shrink a little, then put the unit on a second line.
+        while (valuePaint.measureText(value) > innerWidth && valuePaint.textSize > 8f) {
+            valuePaint.textSize -= 0.5f
         }
-        val valueLines = wrapTextToWidth(value, valuePaint, innerWidth)
-        canvas.drawText(valueLines.firstOrNull().orEmpty(), left + 8f, top + 38f, valuePaint)
+        if (valuePaint.measureText(value) <= innerWidth) {
+            canvas.drawText(value, left + 8f, top + 38f, valuePaint)
+        } else {
+            val number = value.substringBeforeLast(" ")
+            val unit = value.substringAfterLast(" ", "")
+            canvas.drawText(number, left + 8f, top + 33f, valuePaint)
+            if (unit.isNotBlank() && unit != number) canvas.drawText(unit, left + 8f, top + 43f, valuePaint)
+        }
 
         val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#64748B")
@@ -749,24 +775,30 @@ object GraphicalPdfExporter {
         canvas.drawText(subLines.firstOrNull().orEmpty(), left + 8f, top + 53f, subPaint)
     }
 
-    fun sharePdfFile(context: Context, pdfFile: File, reportTitle: String) {
-        val authority = "${context.packageName}.fileprovider"
-        val uri: Uri = FileProvider.getUriForFile(context, authority, pdfFile)
-        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "application/pdf"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            putExtra(Intent.EXTRA_SUBJECT, "NodeSplit Report - $reportTitle")
-            putExtra(Intent.EXTRA_TEXT, "Attached is the NodeSplit VPN sales & settlement report for $reportTitle.")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    fun sharePdfFile(context: Context, pdfFile: File, reportTitle: String): Result<Unit> {
+        return try {
+            if (!pdfFile.exists()) return Result.failure(IllegalStateException("The PDF file is no longer available."))
+            val authority = "${context.packageName}.fileprovider"
+            val uri: Uri = FileProvider.getUriForFile(context, authority, pdfFile)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "application/pdf"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "NodeSplit report - $reportTitle")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(shareIntent, "Share PDF").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
         }
-        val chooser = Intent.createChooser(shareIntent, "Share PDF Ledger Report").apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        context.startActivity(chooser)
     }
 
     fun openPdfFile(context: Context, pdfFile: File): Result<Unit> {
         return try {
+            if (!pdfFile.exists()) return Result.failure(IllegalStateException("The PDF file is no longer available."))
             val authority = "${context.packageName}.fileprovider"
             val uri: Uri = FileProvider.getUriForFile(context, authority, pdfFile)
             val viewIntent = Intent(Intent.ACTION_VIEW).apply {
@@ -783,6 +815,9 @@ object GraphicalPdfExporter {
     suspend fun copyFileToUri(context: Context, sourceFile: File, targetUri: Uri): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
+                if (!sourceFile.exists()) {
+                    return@withContext Result.failure(IllegalStateException("The PDF file is no longer available. Export it again."))
+                }
                 context.contentResolver.openOutputStream(targetUri)?.use { outStream ->
                     sourceFile.inputStream().use { inStream ->
                         inStream.copyTo(outStream)

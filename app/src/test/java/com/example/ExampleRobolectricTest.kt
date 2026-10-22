@@ -69,11 +69,15 @@ class ExampleRobolectricTest {
         assertEquals(13_500L, negativeCalc.amountSellerPaysAdminToman)
 
         // T08: Verify captured zero costPerGbToman == 0L is preserved when hasCapturedCostPerGb == true
+        val oneItem = listOf<Map<String, Any>>(
+            mapOf("itemId" to "s1", "customerName" to "Ali", "dataGb" to 50.0, "priceToman" to 200_000L, "isPaid" to false)
+        )
         val zeroRateArchive = LedgerArchive(
             id = "arch_zero",
             totalSalesToman = 200_000L,
             totalGb = 50.0,
             entryCount = 1,
+            items = oneItem,
             costPerGbToman = 0L,
             adminProfitPercent = 50,
             hasCapturedCostPerGb = true,
@@ -91,6 +95,7 @@ class ExampleRobolectricTest {
             totalSalesToman = 200_000L,
             totalGb = 50.0,
             entryCount = 1,
+            items = oneItem,
             costPerGbToman = 0L,
             adminProfitPercent = 50,
             hasCapturedCostPerGb = false,
@@ -130,7 +135,7 @@ class ExampleRobolectricTest {
             )
         )
         val payload = GraphicalPdfExporter.buildPayloadFromActiveLedger(
-            bookTitle = "My Private Ledger (Admin)",
+            bookTitle = "My private book",
             ownerName = "admin@gmail.com",
             entries = sampleEntries,
             costPerGbToman = 1_200L,

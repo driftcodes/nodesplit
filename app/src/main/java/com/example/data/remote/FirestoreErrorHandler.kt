@@ -1,6 +1,7 @@
 package com.example.data.remote
 
 import android.util.Log
+import com.example.BuildConfig
 import com.google.firebase.auth.FirebaseAuth
 import org.json.JSONArray
 import org.json.JSONObject
@@ -30,6 +31,15 @@ private fun maskUidForLog(uid: String?): String {
 }
 
 fun handleFirestoreError(exception: Exception, operationType: OperationType, path: String?): String {
+    // PRIV-02: Release builds log only the operation and the error code, never paths (which contain
+    // user ids), emails or message text.
+    if (!BuildConfig.DEBUG) {
+        val code = (exception as? com.google.firebase.firestore.FirebaseFirestoreException)?.code?.name
+            ?: exception.javaClass.simpleName
+        val summary = "Firestore ${operationType.value} failed: $code"
+        Log.e("FirestoreError", summary)
+        return summary
+    }
     val auth = FirebaseAuth.getInstance()
     val currentUser = auth.currentUser
 

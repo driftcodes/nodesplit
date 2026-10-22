@@ -11,27 +11,32 @@ import com.example.data.model.FinancialCalculator
 import com.example.data.model.LedgerArchive
 import com.example.data.model.LedgerSummaryMetrics
 import com.example.data.model.LedgerTargetBook
-import com.example.data.model.PaymentFilter
 import com.example.data.model.SaleEntry
 import com.example.data.model.TomanFormatter
 import com.example.data.model.UserProfile
 import com.example.data.model.WorkspaceConfig
+import com.example.data.repository.ConcurrentLedgerEditException
 import com.example.data.repository.LedgerRepository
+import com.example.data.repository.WorkspaceNotConfiguredException
 import com.example.data.repository.WriteAckStatus
 import com.example.util.GraphicalPdfExporter
 import com.example.util.PdfReportPayload
+import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
@@ -44,6 +49,9 @@ sealed interface WorkspaceSessionState {
         val workspace: WorkspaceConfig,
         val profile: UserProfile
     ) : WorkspaceSessionState
+
+    /** SEC-04: config/workspace does not exist yet; the owner must create it once in the console. */
+    data class NotConfigured(val signedInUid: String) : WorkspaceSessionState
     data class Error(val message: String) : WorkspaceSessionState
 }
 
@@ -51,6 +59,12 @@ data class ActivePdfExportReady(
     val file: File,
     val title: String,
     val payload: PdfReportPayload
+)
+
+/** REL-02: Entries are always tagged with the book they were loaded for. */
+private data class BookEntries(
+    val ownerUid: String,
+    val entries: List<SaleEntry>
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -66,6 +80,7 @@ class LedgerViewModel(
 
     // REL-01: Single tracked coroutine job for live workspace/profile listeners to prevent duplicate collectors
     private var liveSessionJob: Job? = null
+    private var invitationMigrationStarted = false
 
     // Forces all Firestore snapshot flows to re-attach cleanly when session re-initializes
     private val _refreshNonce = MutableStateFlow(0)
@@ -77,9 +92,6 @@ class LedgerViewModel(
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
-    private val _paymentFilter = MutableStateFlow(PaymentFilter.ALL)
-    val paymentFilter: StateFlow<PaymentFilter> = _paymentFilter.asStateFlow()
-
     private val _statusBannerMessage = MutableStateFlow<String?>(null)
     val statusBannerMessage: StateFlow<String?> = _statusBannerMessage.asStateFlow()
 
@@ -88,6 +100,13 @@ class LedgerViewModel(
 
     private val _readyPdfExport = MutableStateFlow<ActivePdfExportReady?>(null)
     val readyPdfExport: StateFlow<ActivePdfExportReady?> = _readyPdfExport.asStateFlow()
+
+    // REL-03: A failed query is shown as an error, never as an empty (zero) ledger.
+    private val _ledgerLoadError = MutableStateFlow<String?>(null)
+    val ledgerLoadError: StateFlow<String?> = _ledgerLoadError.asStateFlow()
+
+    private val _archiveLoadError = MutableStateFlow<String?>(null)
+    val archiveLoadError: StateFlow<String?> = _archiveLoadError.asStateFlow()
 
     init {
         initializeWorkspaceAndProfile()
@@ -109,9 +128,10 @@ class LedgerViewModel(
                     observeLiveWorkspaceAndProfile(workspace, initialProfile)
                 },
                 onFailure = { error ->
-                    _sessionState.value = WorkspaceSessionState.Error(
-                        error.localizedMessage ?: "Failed to load workspace configuration."
-                    )
+                    _sessionState.value = when {
+                        error is WorkspaceNotConfiguredException -> WorkspaceSessionState.NotConfigured(error.signedInUid)
+                        else -> WorkspaceSessionState.Error(describeError(error, "Failed to load workspace configuration."))
+                    }
                 }
             )
         }
@@ -123,9 +143,18 @@ class LedgerViewModel(
     ) {
         var lastKnownWorkspace = initialWorkspace
         var lastKnownProfile = initialProfile
+        var profileAccessDenied = false
         combine(
             repository.observeWorkspaceConfig().catch { emit(lastKnownWorkspace) },
-            repository.observeUserProfile(currentUserId).catch { emit(lastKnownProfile) }
+            repository.observeUserProfile(currentUserId).catch { error ->
+                // REL-03 / SEC-03: A denial is never answered with the last approved profile.
+                if (error is FirebaseFirestoreException && error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    profileAccessDenied = true
+                    emit(null)
+                } else {
+                    emit(lastKnownProfile)
+                }
+            }
         ) { liveWorkspace, liveProfile ->
             val resolvedWorkspace = liveWorkspace ?: lastKnownWorkspace
             lastKnownWorkspace = resolvedWorkspace
@@ -136,18 +165,38 @@ class LedgerViewModel(
             lastKnownProfile = resolvedProfile
             resolvedWorkspace to resolvedProfile
         }.collect { (ws, prof) ->
-            _sessionState.value = WorkspaceSessionState.Ready(ws, prof)
+            _sessionState.value = if (profileAccessDenied) {
+                WorkspaceSessionState.Error("The server denied access to your account. Sign out and sign in again, or contact the Admin.")
+            } else {
+                WorkspaceSessionState.Ready(ws, prof)
+            }
+            if (prof.isAdmin) startInvitationKeyMigration(ws.adminUid)
         }
     }
+
+    private fun startInvitationKeyMigration(adminUid: String) {
+        if (invitationMigrationStarted) return
+        invitationMigrationStarted = true
+        viewModelScope.launch {
+            repository.migrateLegacyInvitationKeys(adminUid).onFailure { e ->
+                // Retried on the next app start; old keys keep working meanwhile.
+                Log.w(TAG, "Invitation key migration deferred: ${e.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private val readySession: Flow<WorkspaceSessionState.Ready?> = _sessionState
+        .map { it as? WorkspaceSessionState.Ready }
 
     // Observe all users in workspace (only active when current user is Admin)
     val workspaceUsers: StateFlow<List<UserProfile>> = combine(
         _sessionState,
         _refreshNonce
-    ) { state, _ -> state }
-        .flatMapLatest { state ->
-            if (state is WorkspaceSessionState.Ready && state.profile.isAdmin) {
-                repository.observeWorkspaceUsers(state.workspace.adminUid)
+    ) { state, _ -> (state as? WorkspaceSessionState.Ready)?.takeIf { it.profile.isAdmin }?.workspace?.adminUid }
+        .distinctUntilChanged()
+        .flatMapLatest { adminUid ->
+            if (adminUid != null) {
+                repository.observeWorkspaceUsers(adminUid)
                     .catch { e ->
                         Log.w(TAG, "Failed to observe workspace users", e)
                         emit(emptyList())
@@ -162,10 +211,11 @@ class LedgerViewModel(
     val approvedEmails: StateFlow<List<ApprovedEmail>> = combine(
         _sessionState,
         _refreshNonce
-    ) { state, _ -> state }
-        .flatMapLatest { state ->
-            if (state is WorkspaceSessionState.Ready && state.profile.isAdmin) {
-                repository.observeApprovedSellerEmails(state.workspace.adminUid)
+    ) { state, _ -> (state as? WorkspaceSessionState.Ready)?.takeIf { it.profile.isAdmin }?.workspace?.adminUid }
+        .distinctUntilChanged()
+        .flatMapLatest { adminUid ->
+            if (adminUid != null) {
+                repository.observeApprovedSellerEmails(adminUid)
                     .catch { e ->
                         Log.w(TAG, "Failed to observe approved emails", e)
                         emit(emptyList())
@@ -189,8 +239,8 @@ class LedgerViewModel(
                 ?: "Admin"
             val adminBook = LedgerTargetBook(
                 ownerUid = state.profile.userId,
-                title = "My Private Ledger (Admin)",
-                subtitle = "Private business book",
+                title = "My private book",
+                subtitle = "Only you can see this book",
                 cleanOwnerName = adminCleanName,
                 isPrivateAdminBook = true
             )
@@ -202,8 +252,12 @@ class LedgerViewModel(
                         ?: seller.email.substringBefore("@").ifBlank { "Seller" }
                     LedgerTargetBook(
                         ownerUid = seller.userId,
-                        title = "Seller: $sellerCleanName",
-                        subtitle = seller.status,
+                        title = sellerCleanName,
+                        subtitle = when (seller.status) {
+                            "APPROVED" -> "Seller"
+                            "REVOKED" -> "Seller (access revoked)"
+                            else -> "Seller (waiting for approval)"
+                        },
                         cleanOwnerName = sellerCleanName,
                         isPrivateAdminBook = false
                     )
@@ -216,8 +270,8 @@ class LedgerViewModel(
             listOf(
                 LedgerTargetBook(
                     ownerUid = state.profile.userId,
-                    title = "$sellerCleanName's Ledger",
-                    subtitle = "Active Seller Ledger",
+                    title = "My sales",
+                    subtitle = sellerCleanName,
                     cleanOwnerName = sellerCleanName,
                     isPrivateAdminBook = false
                 )
@@ -230,16 +284,14 @@ class LedgerViewModel(
         _selectedLedgerOwnerUid,
         _sessionState
     ) { books, selectedUid, state ->
+        // REL-02: If the selected seller disappears, fall back to the viewer's own book.
         books.firstOrNull { it.ownerUid == selectedUid }
+            ?: books.firstOrNull { it.ownerUid == currentUserId }
             ?: books.firstOrNull()
             ?: LedgerTargetBook(
                 ownerUid = currentUserId,
-                title = if (state is WorkspaceSessionState.Ready && state.profile.isAdmin) {
-                    "My Private Ledger (Admin)"
-                } else {
-                    "My Sales Ledger"
-                },
-                subtitle = "Active VPN Ledger",
+                title = if (state is WorkspaceSessionState.Ready && state.profile.isAdmin) "My private book" else "My sales",
+                subtitle = "",
                 cleanOwnerName = if (state is WorkspaceSessionState.Ready && state.profile.isAdmin) "Admin" else "Seller",
                 isPrivateAdminBook = state is WorkspaceSessionState.Ready && state.profile.isAdmin
             )
@@ -248,33 +300,58 @@ class LedgerViewModel(
         SharingStarted.WhileSubscribed(5000L),
         LedgerTargetBook(
             ownerUid = currentUserId,
-            title = "My Sales Ledger",
-            subtitle = "Active VPN Ledger",
+            title = "My sales",
+            subtitle = "",
             cleanOwnerName = "Seller",
             isPrivateAdminBook = false
         )
     )
 
-    // Observes the "submitted_current" snapshot for the selected book (when Seller pressed "Send to Admin")
-    val submittedListSnapshot: StateFlow<LedgerArchive?> = combine(
-        _sessionState,
+    private val approvedBookKey: Flow<Pair<WorkspaceSessionState.Ready, String>?> = combine(
+        readySession,
         currentTargetBook,
         _refreshNonce
-    ) { state, targetBook, _ ->
-        state to targetBook.ownerUid
-    }.flatMapLatest { (state, effectiveOwnerUid) ->
-        if (state is WorkspaceSessionState.Ready && state.profile.isApproved) {
-            repository.observeSubmittedSellerList(
-                ledgerOwnerUid = effectiveOwnerUid,
-                workspaceAdminUid = state.workspace.adminUid
-            ).catch { e ->
-                Log.w(TAG, "Error observing submitted seller list", e)
-                emit(null)
-            }
-        } else {
-            flowOf(null)
+    ) { ready, targetBook, nonce ->
+        ready?.takeIf { it.profile.isApproved }?.let { Triple(it, targetBook.ownerUid, nonce) }
+    }
+        .distinctUntilChanged { old, new ->
+            old?.second == new?.second && old?.third == new?.third &&
+                old?.first?.workspace?.adminUid == new?.first?.workspace?.adminUid &&
+                old?.first?.profile?.isAdmin == new?.first?.profile?.isAdmin
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), null)
+        .map { triple -> triple?.let { it.first to it.second } }
+
+    // The report the selected book's seller most recently sent (OFF-04 / DATA-01).
+    val submittedListSnapshot: StateFlow<LedgerArchive?> = approvedBookKey
+        .flatMapLatest { key ->
+            if (key != null && key.second != key.first.workspace.adminUid) {
+                repository.observeLatestSubmission(
+                    ledgerOwnerUid = key.second,
+                    workspaceAdminUid = key.first.workspace.adminUid
+                ).catch { e ->
+                    Log.w(TAG, "Error observing latest report", e)
+                    emit(null)
+                }
+            } else {
+                flowOf(null)
+            }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), null)
+
+    // Every report sent from the selected seller book, newest first.
+    val submissionHistory: StateFlow<List<LedgerArchive>> = approvedBookKey
+        .flatMapLatest { key ->
+            if (key != null && key.second != key.first.workspace.adminUid) {
+                repository.observeSubmissionHistory(
+                    ledgerOwnerUid = key.second,
+                    workspaceAdminUid = key.first.workspace.adminUid
+                ).catch { e ->
+                    Log.w(TAG, "Error observing report history", e)
+                    emit(emptyList())
+                }
+            } else {
+                flowOf(emptyList())
+            }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
 
     // OFF-04: Honest delivery status (distinguishes local queued snapshot from confirmed server timestamp)
     val lastSentToAdminFormatted: StateFlow<String?> = submittedListSnapshot
@@ -284,51 +361,52 @@ class LedgerViewModel(
                 return@map "Queued to send (waiting for connection)"
             }
             val date = snapshot.createdAt?.toDate() ?: return@map null
-            "Uploaded ${SimpleDateFormat("MMM dd, HH:mm", Locale.US).format(date)}"
+            val settled = if (snapshot.isSettled) " • Settled" else ""
+            "Uploaded ${SimpleDateFormat("MMM dd, HH:mm", Locale.US).format(date)}$settled"
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), null)
 
     // Active sale entries for the currently selected ledger book:
     // - For Sellers (or Admin's Private Book): their own working entries
-    // - For Admin viewing a Seller's Book: ONLY the snapshot that the Seller sent via "Send to Admin"
-    val rawEntries: StateFlow<List<SaleEntry>> = combine(
-        _sessionState,
-        currentTargetBook,
-        _refreshNonce
-    ) { state, targetBook, _ ->
-        state to targetBook.ownerUid
-    }.flatMapLatest { (state, effectiveOwnerUid) ->
-        if (state is WorkspaceSessionState.Ready && state.profile.isApproved) {
-            val isAdminInspectingSeller = state.profile.isAdmin && effectiveOwnerUid != state.profile.userId
-            if (isAdminInspectingSeller) {
-                repository.observeSubmittedSellerList(
-                    ledgerOwnerUid = effectiveOwnerUid,
+    // - For Admin viewing a Seller's Book: ONLY the latest report that the Seller sent via "Send to Admin"
+    private val bookEntries: StateFlow<BookEntries?> = approvedBookKey
+        .flatMapLatest { key ->
+            if (key == null) return@flatMapLatest flowOf(null)
+            val (state, ownerUid) = key
+            val isAdminInspectingSeller = state.profile.isAdmin && ownerUid != state.profile.userId
+            val source: Flow<List<SaleEntry>> = if (isAdminInspectingSeller) {
+                repository.observeLatestSubmission(
+                    ledgerOwnerUid = ownerUid,
                     workspaceAdminUid = state.workspace.adminUid
-                ).map { submittedArchive ->
-                    submittedArchive?.parsedItems()?.mapIndexed { idx, item ->
-                        item.toSaleEntry(
-                            ownerUid = effectiveOwnerUid,
-                            workspaceAdminUid = state.workspace.adminUid,
-                            index = idx
-                        )
+                ).map { report ->
+                    report?.parsedItems()?.mapIndexed { idx, item ->
+                        item.toSaleEntry(ownerUid = ownerUid, workspaceAdminUid = state.workspace.adminUid, index = idx)
                     } ?: emptyList()
-                }.catch { e ->
-                    Log.w(TAG, "Error observing seller submitted entries", e)
-                    emit(emptyList())
                 }
             } else {
                 repository.observeLedgerEntries(
-                    ledgerOwnerUid = effectiveOwnerUid,
+                    ledgerOwnerUid = ownerUid,
                     workspaceAdminUid = state.workspace.adminUid
-                ).catch { e ->
-                    Log.w(TAG, "Error observing entries", e)
-                    emit(emptyList())
-                }
+                )
             }
-        } else {
-            flowOf(emptyList())
-        }
+            source
+                .onEach { _ledgerLoadError.value = null }
+                .map<List<SaleEntry>, BookEntries?> { BookEntries(ownerUid, it) }
+                .catch { e ->
+                    Log.w(TAG, "Error observing entries", e)
+                    _ledgerLoadError.value = describeError(e, "Could not load sales.")
+                    emit(null)
+                }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), null)
+
+    val rawEntries: StateFlow<List<SaleEntry>> = combine(bookEntries, currentTargetBook) { loaded, book ->
+        loaded?.takeIf { it.ownerUid == book.ownerUid }?.entries ?: emptyList()
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    /** False while a book switch is still loading; dangerous actions are disabled meanwhile. */
+    val isSelectedBookLoaded: StateFlow<Boolean> = combine(bookEntries, currentTargetBook) { loaded, book ->
+        loaded?.ownerUid == book.ownerUid
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), false)
 
     // OFF-03: Indicates whether any active sale or sent snapshot is waiting in the local outbox
     val hasPendingSyncWrites: StateFlow<Boolean> = combine(
@@ -368,7 +446,7 @@ class LedgerViewModel(
         val profile = (state as? WorkspaceSessionState.Ready)?.profile
         val isAdminViewingSeller = profile?.isAdmin == true && targetBook.ownerUid != profile.userId
 
-        if (isAdminViewingSeller && submittedSnapshot != null) {
+        if (isAdminViewingSeller && submittedSnapshot != null && submittedSnapshot.ledgerOwnerUid == targetBook.ownerUid) {
             submittedSnapshot.computeMetrics(
                 fallbackCostPerGb = workspace?.costPerGbToman ?: 1_000L,
                 fallbackAdminPercent = workspace?.adminProfitPercent ?: 50
@@ -377,57 +455,57 @@ class LedgerViewModel(
             val costPerGb = workspace?.costPerGbToman ?: 1_000L
             val adminPct = workspace?.adminProfitPercent ?: 50
             FinancialCalculator.computeActiveMetrics(
-                entries = entries,
+                entries = if (isAdminViewingSeller) emptyList() else entries,
                 costPerGbToman = costPerGb,
                 adminProfitPercent = adminPct
             )
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), LedgerSummaryMetrics())
 
-    // Archived cycles for the currently selected ledger book
-    val archives: StateFlow<List<LedgerArchive>> = combine(
-        _sessionState,
-        currentTargetBook,
-        _refreshNonce
-    ) { state, targetBook, _ ->
-        state to targetBook.ownerUid
-    }.flatMapLatest { (state, effectiveOwnerUid) ->
-        if (state is WorkspaceSessionState.Ready && state.profile.isApproved) {
-            repository.observeLedgerArchives(
-                ledgerOwnerUid = effectiveOwnerUid,
-                workspaceAdminUid = state.workspace.adminUid
-            ).catch { e ->
-                Log.w(TAG, "Error observing archives", e)
-                emit(emptyList())
+    // Archived cycles for the currently selected ledger book (voided ones last)
+    val archives: StateFlow<List<LedgerArchive>> = approvedBookKey
+        .flatMapLatest { key ->
+            if (key != null) {
+                repository.observeLedgerArchives(
+                    ledgerOwnerUid = key.second,
+                    workspaceAdminUid = key.first.workspace.adminUid
+                )
+                    .onEach { _archiveLoadError.value = null }
+                    .catch { e ->
+                        Log.w(TAG, "Error observing archives", e)
+                        _archiveLoadError.value = describeError(e, "Could not load archives.")
+                        emit(emptyList())
+                    }
+            } else {
+                flowOf(emptyList())
             }
-        } else {
-            flowOf(emptyList())
-        }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
 
     // Admin-managed workspace GB & Toman presets (synced from workspaceAdminUid so Admin changes apply everywhere)
     val customPresets: StateFlow<List<DataPreset>> = combine(
         _sessionState,
         _refreshNonce
     ) { state, _ ->
-        state
-    }.flatMapLatest { state ->
-        if (state is WorkspaceSessionState.Ready && state.profile.isApproved) {
-            repository.observeCustomPresets(
-                ledgerOwnerUid = state.workspace.adminUid,
-                workspaceAdminUid = state.workspace.adminUid
-            ).catch { e ->
-                Log.w(TAG, "Error observing presets", e)
-                emit(emptyList())
+        (state as? WorkspaceSessionState.Ready)?.takeIf { it.profile.isApproved }?.workspace?.adminUid
+    }
+        .distinctUntilChanged()
+        .flatMapLatest { adminUid ->
+            if (adminUid != null) {
+                repository.observeCustomPresets(
+                    ledgerOwnerUid = adminUid,
+                    workspaceAdminUid = adminUid
+                ).catch { e ->
+                    Log.w(TAG, "Error observing presets", e)
+                    emit(emptyList())
+                }
+            } else {
+                flowOf(emptyList())
             }
-        } else {
-            flowOf(emptyList())
-        }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
 
     // Merges default presets with Admin's saved preset overrides/additions by ID
     val allPresets: StateFlow<List<DataPreset>> = customPresets
-        .combine(_sessionState) { savedPresets, _ ->
+        .map { savedPresets ->
             val savedById = savedPresets.associateBy { it.id }
             val mergedDefaults = TomanFormatter.defaultBuiltInPresets.map { defaultPreset ->
                 savedById[defaultPreset.id] ?: defaultPreset
@@ -454,10 +532,6 @@ class LedgerViewModel(
         _searchQuery.value = query
     }
 
-    fun updatePaymentFilter(filter: PaymentFilter) {
-        _paymentFilter.value = filter
-    }
-
     fun clearBannerMessage() {
         _statusBannerMessage.value = null
     }
@@ -466,13 +540,17 @@ class LedgerViewModel(
         _readyPdfExport.value = null
     }
 
+    fun refreshListeners() {
+        _refreshNonce.value += 1
+    }
+
     fun updateWorkspaceFinancialRates(
         costPerGbToman: Long,
         adminProfitPercent: Int
     ) {
         val state = _sessionState.value as? WorkspaceSessionState.Ready ?: return
         if (!state.profile.isAdmin) {
-            _statusBannerMessage.value = "Only the Admin can modify Cost per GB and Profit Split settings."
+            _statusBannerMessage.value = "Only the Admin can change the cost per GB and the profit split."
             return
         }
         if (_isBusy.value) return
@@ -489,10 +567,10 @@ class LedgerViewModel(
                 )
                 result.fold(
                     onSuccess = {
-                        _statusBannerMessage.value = "Updated rates: ${TomanFormatter.format(cleanCost)}/GB • Split: Seller $sellerPct% / Admin $cleanAdminPct%."
+                        _statusBannerMessage.value = "Saved: ${TomanFormatter.format(cleanCost)} per GB • Seller $sellerPct% / Admin $cleanAdminPct%. Sent reports and archives keep their own rates."
                     },
                     onFailure = { e ->
-                        _statusBannerMessage.value = e.localizedMessage ?: "Failed to update workspace rates."
+                        _statusBannerMessage.value = describeError(e, "Could not save the rates.")
                     }
                 )
             } finally {
@@ -517,7 +595,12 @@ class LedgerViewModel(
     ) {
         val state = _sessionState.value as? WorkspaceSessionState.Ready ?: return
         if (_isBusy.value) return
-        val targetOwnerUid = currentTargetBook.value.ownerUid
+        val targetBook = currentTargetBook.value
+        val targetOwnerUid = targetBook.ownerUid
+        if (state.profile.isAdmin && targetOwnerUid != state.profile.userId) {
+            _statusBannerMessage.value = "A seller's sales can only be changed by that seller."
+            return
+        }
 
         val trimmedName = customerName.trim()
         if (trimmedName.isBlank()) {
@@ -580,12 +663,12 @@ class LedgerViewModel(
                         _statusBannerMessage.value = if (editingEntryId.isNullOrBlank()) {
                             "Saved ${TomanFormatter.formatGb(dataGb)}$bonusSuffix for $trimmedName (${TomanFormatter.format(priceToman)})."
                         } else {
-                            "Updated sale record for $trimmedName."
+                            "Updated the sale for $trimmedName."
                         }
                         onComplete()
                     },
                     onFailure = { e ->
-                        _statusBannerMessage.value = e.localizedMessage ?: "Could not save sale record."
+                        _statusBannerMessage.value = describeError(e, "Could not save the sale.")
                     }
                 )
             } finally {
@@ -600,11 +683,8 @@ class LedgerViewModel(
         val isAdminViewingSeller = state.profile.isAdmin && targetOwnerUid != state.profile.userId
         if (isAdminViewingSeller) {
             val submitted = submittedListSnapshot.value ?: return
-            val items = submitted.parsedItems()
-            val idx = items.indexOfFirst { it.itemId == entry.id || it.customerName == entry.customerName }
-            if (idx in items.indices) {
-                toggleArchiveItemPaidStatus(submitted, idx, !entry.isPaid)
-            }
+            if (submitted.ledgerOwnerUid != targetOwnerUid) return
+            toggleArchiveItemPaidStatus(submitted, entry.id, !entry.isPaid)
             return
         }
         val nextPaid = !entry.isPaid
@@ -615,33 +695,36 @@ class LedgerViewModel(
                 isPaid = nextPaid
             )
             if (result.isFailure) {
-                _statusBannerMessage.value = result.exceptionOrNull()?.localizedMessage ?: "Failed to update payment status."
+                _statusBannerMessage.value = describeError(result.exceptionOrNull(), "Could not update the payment checkbox.")
             }
         }
     }
 
+    /** DATA-03: One item's checkbox, by stable item id; the snapshot's money fields never change. */
     fun toggleArchiveItemPaidStatus(
         archive: LedgerArchive,
-        itemIndex: Int,
+        itemId: String,
         newPaid: Boolean
     ) {
-        val state = _sessionState.value as? WorkspaceSessionState.Ready ?: return
-        val targetOwnerUid = archive.ledgerOwnerUid.ifBlank {
-            currentTargetBook.value.ownerUid.ifBlank { state.profile.userId }
+        if (archive.isLegacyReport) {
+            _statusBannerMessage.value = "This older report is read-only. Payment checkboxes work on reports sent with this version."
+            return
         }
-        val currentItems = archive.parsedItems().toMutableList()
-        if (itemIndex !in currentItems.indices) return
-        currentItems[itemIndex] = currentItems[itemIndex].copy(isPaid = newPaid)
-
+        if (archive.isVoided) {
+            _statusBannerMessage.value = "This archive was voided and is read-only."
+            return
+        }
+        val targetOwnerUid = archive.ledgerOwnerUid.ifBlank { currentTargetBook.value.ownerUid }
         viewModelScope.launch {
-            val result = repository.updateArchiveItemsPaidStatus(
+            val result = repository.updateSnapshotItemPaidStatus(
                 ledgerOwnerUid = targetOwnerUid,
-                archiveId = archive.id,
-                updatedItems = currentItems
+                collection = archive.sourceCollection,
+                snapshotId = archive.id,
+                itemId = itemId,
+                isPaid = newPaid
             )
             if (result.isFailure) {
-                _statusBannerMessage.value = result.exceptionOrNull()?.localizedMessage
-                    ?: "Failed to update archived payment status."
+                _statusBannerMessage.value = describeError(result.exceptionOrNull(), "Could not update the payment checkbox.")
             }
         }
     }
@@ -655,10 +738,10 @@ class LedgerViewModel(
             )
             result.fold(
                 onSuccess = {
-                    _statusBannerMessage.value = "Removed ${entry.customerName} from active ledger."
+                    _statusBannerMessage.value = "Deleted the sale for ${entry.customerName}."
                 },
                 onFailure = { e ->
-                    _statusBannerMessage.value = e.localizedMessage ?: "Failed to delete sale."
+                    _statusBannerMessage.value = describeError(e, "Could not delete the sale.")
                 }
             )
         }
@@ -667,7 +750,17 @@ class LedgerViewModel(
     fun sendCurrentListToAdmin() {
         val state = _sessionState.value as? WorkspaceSessionState.Ready ?: return
         if (_isBusy.value) return
+        if (state.profile.isAdmin || currentTargetBook.value.ownerUid != state.profile.userId) return
+        if (!isSelectedBookLoaded.value) {
+            _statusBannerMessage.value = "Your sales are still loading. Try again in a moment."
+            return
+        }
         val currentEntries = rawEntries.value
+        if (currentEntries.isEmpty()) {
+            _statusBannerMessage.value = "There are no sales to send."
+            return
+        }
+        val metrics = summaryMetrics.value
         val ownerName = state.profile.displayName
             .takeIf { it.isNotBlank() && !it.contains("@") }
             ?: state.profile.email.substringBefore("@").ifBlank { "Seller" }
@@ -680,19 +773,19 @@ class LedgerViewModel(
                     ownerName = ownerName,
                     activeEntries = currentEntries,
                     costPerGbToman = state.workspace.costPerGbToman,
-                    adminProfitPercent = state.workspace.adminProfitPercent
+                    adminProfitPercent = state.workspace.adminProfitPercent,
+                    settingsRevision = state.workspace.settingsRevision
                 )
                 result.fold(
                     onSuccess = { ackStatus ->
-                        val metrics = summaryMetrics.value
                         _statusBannerMessage.value = if (ackStatus == WriteAckStatus.SAVED_OFFLINE_PENDING_SYNC) {
-                            "Queued report (${currentEntries.size} sales) to send when online."
+                            "Report with ${currentEntries.size} sales is queued and will upload when you're online."
                         } else {
-                            "Sent report (${currentEntries.size} sales • Amount due to Admin: ${TomanFormatter.format(metrics.sellerPayableToAdminToman)})."
+                            "Report uploaded: ${currentEntries.size} sales • amount due to Admin ${TomanFormatter.format(metrics.sellerPayableToAdminToman)}."
                         }
                     },
                     onFailure = { e ->
-                        _statusBannerMessage.value = e.localizedMessage ?: "Failed to send list to Admin."
+                        _statusBannerMessage.value = describeError(e, "Could not send the report.")
                     }
                 )
             } finally {
@@ -711,9 +804,17 @@ class LedgerViewModel(
         // REL-02: Bind reset strictly to the currently displayed book's ownerUid and snapshot
         val targetBook = currentTargetBook.value
         val targetOwnerUid = targetBook.ownerUid
+        if (state.profile.isAdmin && targetOwnerUid != state.profile.userId) {
+            _statusBannerMessage.value = "Only the seller can start a new cycle in their own book."
+            return
+        }
+        if (!isSelectedBookLoaded.value) {
+            _statusBannerMessage.value = "This book is still loading. Try again in a moment."
+            return
+        }
         val currentEntries = rawEntries.value
         if (currentEntries.isEmpty()) {
-            _statusBannerMessage.value = "Active ledger is already empty."
+            _statusBannerMessage.value = "There are no active sales in this cycle."
             return
         }
 
@@ -729,19 +830,24 @@ class LedgerViewModel(
                     activeEntries = currentEntries,
                     keepArchive = keepArchive,
                     costPerGbToman = state.workspace.costPerGbToman,
-                    adminProfitPercent = state.workspace.adminProfitPercent
+                    adminProfitPercent = state.workspace.adminProfitPercent,
+                    settingsRevision = state.workspace.settingsRevision
                 )
                 result.fold(
                     onSuccess = { archiveId ->
                         _statusBannerMessage.value = if (archiveId != null) {
-                            "Started new cycle. Saved ${currentEntries.size} sales to Archives."
+                            "New cycle started. ${currentEntries.size} sales were saved to Archives."
                         } else {
-                            "Started new cycle. Active sales cleared."
+                            "New cycle started. Active sales were cleared without an archive."
                         }
                         onResetSuccess()
                     },
                     onFailure = { e ->
-                        _statusBannerMessage.value = e.localizedMessage ?: "Failed to start new cycle."
+                        _statusBannerMessage.value = if (e is ConcurrentLedgerEditException) {
+                            e.message
+                        } else {
+                            describeError(e, "Could not start a new cycle.")
+                        }
                     }
                 )
             } finally {
@@ -750,14 +856,33 @@ class LedgerViewModel(
         }
     }
 
-    fun deleteArchiveSnapshot(archive: LedgerArchive) {
+    /** DATA-03: Archives are voided with a reason (kept, marked and read-only), never deleted. */
+    fun voidArchiveSnapshot(archive: LedgerArchive, reason: String) {
+        if (archive.isSubmission || archive.isLegacyReport) {
+            _statusBannerMessage.value = "Sent reports are kept as a permanent record and cannot be voided."
+            return
+        }
         // REL-02: Always use the archive's own ledgerOwnerUid, not a separately changing selection flow
         val targetOwnerUid = archive.ledgerOwnerUid.ifBlank { currentTargetBook.value.ownerUid }
         viewModelScope.launch {
-            val result = repository.deleteArchive(targetOwnerUid, archive.id)
+            val result = repository.voidArchive(targetOwnerUid, archive.id, reason)
             result.fold(
-                onSuccess = { _statusBannerMessage.value = "Deleted archive '${archive.cycleTitle}'." },
-                onFailure = { e -> _statusBannerMessage.value = e.localizedMessage ?: "Failed to delete archive." }
+                onSuccess = { _statusBannerMessage.value = "Voided '${archive.cycleTitle}'. It stays in Archives, marked as voided." },
+                onFailure = { e -> _statusBannerMessage.value = describeError(e, "Could not void the archive.") }
+            )
+        }
+    }
+
+    fun setReportSettled(report: LedgerArchive, settled: Boolean) {
+        val state = _sessionState.value as? WorkspaceSessionState.Ready ?: return
+        if (!state.profile.isAdmin || !report.isSubmission) return
+        viewModelScope.launch {
+            val result = repository.setSubmissionSettled(report.ledgerOwnerUid, report.id, settled)
+            result.fold(
+                onSuccess = {
+                    _statusBannerMessage.value = if (settled) "Marked the report as settled." else "Marked the report as not settled."
+                },
+                onFailure = { e -> _statusBannerMessage.value = describeError(e, "Could not update the report.") }
             )
         }
     }
@@ -771,11 +896,11 @@ class LedgerViewModel(
     ) {
         val state = _sessionState.value as? WorkspaceSessionState.Ready ?: return
         if (!state.profile.isAdmin) {
-            _statusBannerMessage.value = "Only the Admin can modify preset package prices."
+            _statusBannerMessage.value = "Only the Admin can change plans."
             return
         }
         if (label.isBlank() || !dataGb.isFinite() || dataGb <= 0.0 || defaultPriceToman < 0L) {
-            _statusBannerMessage.value = "Provide a valid preset name, GB amount, and Toman price."
+            _statusBannerMessage.value = "Provide a valid plan name, GB amount and Toman price."
             return
         }
         viewModelScope.launch {
@@ -792,10 +917,10 @@ class LedgerViewModel(
                 onSuccess = {
                     val action = if (existingPresetId.isNullOrBlank()) "Added" else "Updated"
                     val bonusLabel = if (newUserBonusGb > 0.0) " (+${TomanFormatter.formatGb(newUserBonusGb)} new-user bonus)" else ""
-                    _statusBannerMessage.value = "$action preset '$label' (${TomanFormatter.format(defaultPriceToman)}$bonusLabel)."
+                    _statusBannerMessage.value = "$action plan '$label' (${TomanFormatter.format(defaultPriceToman)}$bonusLabel)."
                 },
                 onFailure = { e ->
-                    _statusBannerMessage.value = e.localizedMessage ?: "Failed to save preset."
+                    _statusBannerMessage.value = describeError(e, "Could not save the plan.")
                 }
             )
         }
@@ -809,14 +934,14 @@ class LedgerViewModel(
             val result = repository.deleteCustomPreset(state.workspace.adminUid, preset.id)
             result.fold(
                 onSuccess = {
-                    if (preset.id.startsWith("builtin_")) {
-                        _statusBannerMessage.value = "Restored '${preset.label}' to default price & bonus."
+                    _statusBannerMessage.value = if (preset.id.startsWith("builtin_")) {
+                        "Restored '${preset.label}' to its default price and bonus. The built-in plan is still available."
                     } else {
-                        _statusBannerMessage.value = "Removed custom preset '${preset.label}'."
+                        "Removed the plan '${preset.label}'."
                     }
                 },
                 onFailure = { e ->
-                    _statusBannerMessage.value = e.localizedMessage ?: "Failed to remove preset."
+                    _statusBannerMessage.value = describeError(e, "Could not remove the plan.")
                 }
             )
         }
@@ -829,8 +954,8 @@ class LedgerViewModel(
         if (!state.profile.isAdmin) return
         if (_isBusy.value) return
         val cleanEmail = TomanFormatter.canonicalizeEmail(email)
-        if (cleanEmail.isBlank() || !cleanEmail.contains("@") || cleanEmail.length < 5) {
-            _statusBannerMessage.value = "Please enter a valid Seller Google email address."
+        if (TomanFormatter.invitationKeyFor(cleanEmail) == null || !cleanEmail.contains("@") || cleanEmail.length < 5) {
+            _statusBannerMessage.value = "Please enter a valid Google email address."
             return
         }
 
@@ -844,10 +969,10 @@ class LedgerViewModel(
                 )
                 result.fold(
                     onSuccess = {
-                        _statusBannerMessage.value = "Approved seller email: $cleanEmail"
+                        _statusBannerMessage.value = "Approved $cleanEmail. They get access when they sign in with that Google account."
                     },
                     onFailure = { e ->
-                        _statusBannerMessage.value = e.localizedMessage ?: "Failed to approve seller email."
+                        _statusBannerMessage.value = describeError(e, "Could not approve that email.")
                     }
                 )
             } finally {
@@ -874,11 +999,14 @@ class LedgerViewModel(
                 )
                 result.fold(
                     onSuccess = {
-                        val actionWord = if (approve) "Approved" else "Revoked"
-                        _statusBannerMessage.value = "$actionWord seller ${sellerProfile.displayName}."
+                        _statusBannerMessage.value = if (approve) {
+                            "Approved ${sellerProfile.displayName}."
+                        } else {
+                            "Revoked ${sellerProfile.displayName}. The server blocks their book as soon as their phone reconnects."
+                        }
                     },
                     onFailure = { e ->
-                        _statusBannerMessage.value = e.localizedMessage ?: "Could not update seller status."
+                        _statusBannerMessage.value = describeError(e, "Could not update the seller.")
                     }
                 )
             } finally {
@@ -895,10 +1023,10 @@ class LedgerViewModel(
             val result = repository.removeApprovedEmail(item.emailKey)
             result.fold(
                 onSuccess = {
-                    _statusBannerMessage.value = "Removed invitation for ${item.email}."
+                    _statusBannerMessage.value = "Cancelled the invitation for ${item.email}. A seller who already signed in keeps access until you revoke them."
                 },
                 onFailure = { e ->
-                    _statusBannerMessage.value = e.localizedMessage ?: "Failed to remove invitation."
+                    _statusBannerMessage.value = describeError(e, "Could not cancel the invitation.")
                 }
             )
         }
@@ -908,6 +1036,10 @@ class LedgerViewModel(
 
     fun exportActiveLedgerToPdf(context: Context) {
         if (_isBusy.value) return
+        if (!isSelectedBookLoaded.value) {
+            _statusBannerMessage.value = "This book is still loading. Try again in a moment."
+            return
+        }
         val entries = rawEntries.value
         val book = currentTargetBook.value
         val metrics = summaryMetrics.value
@@ -935,13 +1067,13 @@ class LedgerViewModel(
                         )
                     },
                     onFailure = { e ->
-                        _statusBannerMessage.value = e.localizedMessage ?: "Failed to generate PDF report."
+                        _statusBannerMessage.value = describeError(e, "Could not create the PDF.")
                     }
                 )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _statusBannerMessage.value = e.localizedMessage ?: "Failed to generate PDF report."
+                _statusBannerMessage.value = describeError(e, "Could not create the PDF.")
             } finally {
                 _isBusy.value = false
             }
@@ -975,13 +1107,13 @@ class LedgerViewModel(
                         )
                     },
                     onFailure = { e ->
-                        _statusBannerMessage.value = e.localizedMessage ?: "Failed to generate Archive PDF."
+                        _statusBannerMessage.value = describeError(e, "Could not create the PDF.")
                     }
                 )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _statusBannerMessage.value = e.localizedMessage ?: "Failed to generate Archive PDF."
+                _statusBannerMessage.value = describeError(e, "Could not create the PDF.")
             } finally {
                 _isBusy.value = false
             }
@@ -999,10 +1131,10 @@ class LedgerViewModel(
             val result = GraphicalPdfExporter.copyFileToUri(appContext, sourceFile, targetUri)
             result.fold(
                 onSuccess = {
-                    _statusBannerMessage.value = "PDF saved to device storage."
+                    _statusBannerMessage.value = "PDF saved."
                 },
                 onFailure = { e ->
-                    _statusBannerMessage.value = e.localizedMessage ?: "Could not write PDF to selected location."
+                    _statusBannerMessage.value = describeError(e, "Could not save the PDF to that location.")
                 }
             )
         }
@@ -1014,6 +1146,19 @@ class LedgerViewModel(
 
     fun reportActionError(message: String) {
         _statusBannerMessage.value = message
+    }
+
+    private fun describeError(error: Throwable?, fallback: String): String {
+        val firestoreCode = (error as? FirebaseFirestoreException)?.code
+        return when (firestoreCode) {
+            FirebaseFirestoreException.Code.PERMISSION_DENIED ->
+                "The server refused this action. Your access may have changed; contact the Admin if it continues."
+            FirebaseFirestoreException.Code.UNAVAILABLE ->
+                "You appear to be offline. Connect to the internet and try again."
+            FirebaseFirestoreException.Code.FAILED_PRECONDITION ->
+                "The server is not ready for this request yet. Try again shortly."
+            else -> error?.localizedMessage?.takeIf { it.isNotBlank() && firestoreCode == null } ?: fallback
+        }
     }
 
     private companion object {

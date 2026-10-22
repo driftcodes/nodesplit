@@ -70,6 +70,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -100,6 +103,7 @@ fun SaleEntrySheet(
     costPerGbToman: Long = 1_000L,
     adminProfitPercent: Int = 50,
     isPrivateAdminBook: Boolean = false,
+    isSaving: Boolean = false,
     onDismiss: () -> Unit,
     onSaveSale: (
         editingId: String?,
@@ -238,14 +242,9 @@ fun SaleEntrySheet(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (editingEntry == null) "Record VPN Sale" else "Edit VPN Sale",
-                        style = MaterialTheme.typography.headlineMedium,
+                        text = if (editingEntry == null) "New sale" else "Edit sale",
+                        style = MaterialTheme.typography.headlineSmall,
                         color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = "Select a preset package, apply New User bonus GB, or override price in Toman",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 IconButton(onClick = onDismiss) {
@@ -262,7 +261,7 @@ fun SaleEntrySheet(
                     customerName = it
                     validationError = null
                 },
-                label = { Text("Customer Name / Telegram ID") },
+                label = { Text("Customer name or Telegram ID") },
                 placeholder = { Text("e.g., Ali Rezaei (@ali_vpn)") },
                 singleLine = true,
                 modifier = Modifier
@@ -280,7 +279,7 @@ fun SaleEntrySheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Quick-Select GB & Toman Presets",
+                    text = "Plans",
                     style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.onSurface
                 )
@@ -317,7 +316,7 @@ fun SaleEntrySheet(
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text(if (showPresetEditor) "Close Preset Editor" else "Edit Presets / +Add")
+                        Text(if (showPresetEditor) "Close" else "Edit plans")
                     }
                 }
             }
@@ -340,9 +339,9 @@ fun SaleEntrySheet(
                         ) {
                             Text(
                                 text = if (editingPresetId != null) {
-                                    "Edit Preset Price & New User Bonus (Admin)"
+                                    "Edit plan"
                                 } else {
-                                    "Create New Package Preset (Admin)"
+                                    "New plan"
                                 },
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.primary
@@ -358,12 +357,12 @@ fun SaleEntrySheet(
                                         presetEditorError = null
                                     }
                                 ) {
-                                    Text("+ New Preset Instead")
+                                    Text("New plan instead")
                                 }
                             }
                         }
                         Text(
-                            text = "Tap any preset chip below to load it and configure its Toman price and New User bonus GB.",
+                            text = "Tap a plan below to load it. Changes apply to every seller's new sales.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -374,7 +373,7 @@ fun SaleEntrySheet(
                                 newPresetLabel = it
                                 presetEditorError = null
                             },
-                            label = { Text("Preset Label (e.g., 20 GB Standard)") },
+                            label = { Text("Plan name (e.g., 20 GB Standard)") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -397,7 +396,7 @@ fun SaleEntrySheet(
                                     newPresetBonusGb = InputValidator.normalizeDigits(it).filter { ch -> ch.isDigit() || ch == '.' }
                                     presetEditorError = null
                                 },
-                                label = { Text("New User +GB") },
+                                label = { Text("New-user bonus GB") },
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                                 modifier = Modifier.weight(1f)
@@ -410,7 +409,7 @@ fun SaleEntrySheet(
                                 newPresetPrice = InputValidator.normalizeDigits(it).filter { ch -> ch.isDigit() }
                                 presetEditorError = null
                             },
-                            label = { Text("Preset Price (Toman)") },
+                            label = { Text("Plan price") },
                             singleLine = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             modifier = Modifier.fillMaxWidth()
@@ -433,9 +432,9 @@ fun SaleEntrySheet(
                                 onClick = {
                                     val gbRes = InputValidator.validateDataGb(newPresetGb, "Plan GB")
                                     val bonusRes = InputValidator.validateBonusGb(newPresetBonusGb)
-                                    val priceRes = InputValidator.validatePriceToman(newPresetPrice, "Preset Price")
+                                    val priceRes = InputValidator.validatePriceToman(newPresetPrice, "Plan price")
                                     when {
-                                        newPresetLabel.isBlank() -> presetEditorError = "Please enter a preset label."
+                                        newPresetLabel.isBlank() -> presetEditorError = "Please enter a plan name."
                                         gbRes.isFailure -> presetEditorError = gbRes.exceptionOrNull()?.message
                                         bonusRes.isFailure -> presetEditorError = bonusRes.exceptionOrNull()?.message
                                         priceRes.isFailure -> presetEditorError = priceRes.exceptionOrNull()?.message
@@ -460,7 +459,7 @@ fun SaleEntrySheet(
                                     }
                                 }
                             ) {
-                                Text(if (editingPresetId != null) "Update Preset" else "Save New Preset")
+                                Text(if (editingPresetId != null) "Update plan" else "Add plan")
                             }
                         }
                     }
@@ -574,15 +573,15 @@ fun SaleEntrySheet(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.PersonAdd,
-                                    contentDescription = "New User Bonus",
+                                    contentDescription = null,
                                     tint = MaterialTheme.colorScheme.secondary,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Text(
                                     text = if (isNewUser) {
-                                        "New User — +${TomanFormatter.formatGb(parsedBonusGb)} Extra Data Applied"
+                                        "New user: +${TomanFormatter.formatGb(parsedBonusGb)} bonus"
                                     } else {
-                                        "New User (First Purchase Bonus GB)"
+                                        "New user (first purchase bonus)"
                                     },
                                     style = MaterialTheme.typography.titleSmall,
                                     color = MaterialTheme.colorScheme.onSurface
@@ -590,9 +589,9 @@ fun SaleEntrySheet(
                             }
                             Text(
                                 text = if (isNewUser) {
-                                    "${TomanFormatter.formatGbNumberOnly(totalAllocatedGb)} GB total (${TomanFormatter.formatGbNumberOnly(parsedBaseGb)} + ${TomanFormatter.formatGbNumberOnly(parsedBonusGb)} bonus) • Price stays ${TomanFormatter.format(parsedPrice)}"
+                                    "${TomanFormatter.formatAllocationSummary(totalAllocatedGb, parsedBonusGb, true)}. The price stays the same; the bonus GB counts toward infrastructure cost."
                                 } else {
-                                    "Check if this is a new customer to include +${TomanFormatter.formatGb(parsedBonusGb)} bonus GB in infrastructure cost at the same sale price"
+                                    "Adds ${TomanFormatter.formatGb(parsedBonusGb)} bonus data at the same price."
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -606,7 +605,7 @@ fun SaleEntrySheet(
 
             // 3. Manual Override Inputs for Data Volume (GB) and Price (Toman)
             Text(
-                text = "Volume & Price (Manually Overridable for Discounts)",
+                text = "Data and price",
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
@@ -622,7 +621,7 @@ fun SaleEntrySheet(
                         baseDataGbText = InputValidator.normalizeDigits(input).filter { it.isDigit() || it == '.' }
                         validationError = null
                     },
-                    label = { Text(if (isNewUser) "Base Plan (GB)" else "Data (GB)") },
+                    label = { Text(if (isNewUser) "Plan data (before bonus)" else "Data") },
                     suffix = { Text("GB") },
                     isError = baseDataGbText.isNotBlank() && baseGbValidation.isFailure,
                     singleLine = true,
@@ -639,7 +638,7 @@ fun SaleEntrySheet(
                         priceTomanText = InputValidator.normalizeDigits(input).filter { it.isDigit() }
                         validationError = null
                     },
-                    label = { Text("Final Price (Toman)") },
+                    label = { Text("Final price") },
                     suffix = { Text("Toman") },
                     isError = priceTomanText.isNotBlank() && priceValidation.isFailure,
                     singleLine = true,
@@ -676,11 +675,11 @@ fun SaleEntrySheet(
                         priceTomanText = ((base * 90L) / 100L).toString()
                         validationError = null
                     },
-                    label = { Text("-10% Discount") },
+                    label = { Text("−10%") },
                     leadingIcon = {
                         Icon(
                             imageVector = Icons.Default.Discount,
-                            contentDescription = "10% discount",
+                            contentDescription = null,
                             modifier = Modifier.size(16.dp)
                         )
                     }
@@ -692,7 +691,7 @@ fun SaleEntrySheet(
                         priceTomanText = ((base * 80L) / 100L).toString()
                         validationError = null
                     },
-                    label = { Text("-20% Discount") }
+                    label = { Text("−20%") }
                 )
                 AssistChip(
                     onClick = {
@@ -701,7 +700,7 @@ fun SaleEntrySheet(
                         priceTomanText = next.toString()
                         validationError = null
                     },
-                    label = { Text("-20,000 Toman") }
+                    label = { Text("−20,000 Toman") }
                 )
                 AssistChip(
                     onClick = {
@@ -710,7 +709,7 @@ fun SaleEntrySheet(
                         priceTomanText = next.toString()
                         validationError = null
                     },
-                    label = { Text("-50,000 Toman") }
+                    label = { Text("−50,000 Toman") }
                 )
                 if (activeDiscount > 0L) {
                     AssistChip(
@@ -718,20 +717,20 @@ fun SaleEntrySheet(
                             priceTomanText = originalPresetPrice.toString()
                             validationError = null
                         },
-                        label = { Text("Reset to Preset") }
+                        label = { Text("Plan price") }
                     )
                 }
             }
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Live Per-Sale Financial Breakdown Preview (UX-01)
+            // Live preview of this one sale (UX-01), using the same calculation as every summary.
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("sale_sheet_live_breakdown_card"),
                 colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
                 ),
                 shape = RoundedCornerShape(14.dp)
             ) {
@@ -739,46 +738,23 @@ fun SaleEntrySheet(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Text(
-                        text = "THIS SALE BREAKDOWN PREVIEW",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "Total Allocated Data: ${
-                            if (isNewUser && effectiveBonusGb > 0.0) {
-                                "${TomanFormatter.formatGbNumberOnly(totalAllocatedGb)} GB total (${TomanFormatter.formatGbNumberOnly(parsedBaseGb)} + ${TomanFormatter.formatGbNumberOnly(effectiveBonusGb)} bonus)"
-                            } else {
-                                TomanFormatter.formatGb(totalAllocatedGb)
-                            }
-                        }",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = "Infrastructure Cost: ${TomanFormatter.format(liveSaleBreakdown.infrastructureCostToman)} (${TomanFormatter.format(costPerGbToman)}/GB)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = "Seller Profit (${liveSaleBreakdown.sellerSharePercent}%): ${TomanFormatter.format(liveSaleBreakdown.sellerProfitToman)}  •  Admin Profit (${liveSaleBreakdown.adminSharePercent}%): ${TomanFormatter.format(liveSaleBreakdown.adminProfitToman)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = if (isPrivateAdminBook) {
-                            "Admin Infra + Share: ${TomanFormatter.format(liveSaleBreakdown.amountSellerPaysAdminToman)}"
-                        } else {
-                            "Amount Seller Pays Admin: ${TomanFormatter.format(liveSaleBreakdown.amountSellerPaysAdminToman)}"
-                        },
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    SectionHeading("This sale")
+                    PreviewLine("Data allocated", TomanFormatter.formatAllocationSummary(totalAllocatedGb, effectiveBonusGb, isNewUser))
+                    PreviewLine("Infrastructure cost", TomanFormatter.format(liveSaleBreakdown.infrastructureCostToman))
+                    if (isPrivateAdminBook) {
+                        PreviewLine("Business profit", TomanFormatter.format(liveSaleBreakdown.netProfitToman))
+                    } else {
+                        PreviewLine("Seller profit (${liveSaleBreakdown.sellerSharePercent}%)", TomanFormatter.format(liveSaleBreakdown.sellerProfitToman))
+                        PreviewLine("Admin profit (${liveSaleBreakdown.adminSharePercent}%)", TomanFormatter.format(liveSaleBreakdown.adminProfitToman))
+                        PreviewLine("Amount due to Admin", TomanFormatter.format(liveSaleBreakdown.amountSellerPaysAdminToman))
+                    }
+                    if (priceValidation.isSuccess && liveSaleBreakdown.netProfitToman < 0L) {
+                        InlineWarning(
+                            "This price is below the infrastructure cost for this sale (a loss of ${TomanFormatter.format(-liveSaleBreakdown.netProfitToman)}). You can still save it."
+                        )
+                    }
                 }
             }
 
@@ -817,12 +793,12 @@ fun SaleEntrySheet(
                     Spacer(modifier = Modifier.width(8.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = if (isPaid) "Paid — Checked (Green Item)" else "Unpaid — Unchecked (Amber Item)",
+                            text = if (isPaid) "Paid" else "Not paid yet",
                             style = MaterialTheme.typography.titleSmall,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = "Visual row indicator only; does not change profit split calculations",
+                            text = "Whether the customer has paid you. It doesn't change any totals.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -836,7 +812,7 @@ fun SaleEntrySheet(
             OutlinedTextField(
                 value = note,
                 onValueChange = { note = it },
-                label = { Text("Optional Note (e.g., Referral discount, Server #2)") },
+                label = { Text("Note (optional)") },
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -890,20 +866,17 @@ fun SaleEntrySheet(
                         }
                     }
                 },
+                enabled = !isSaving,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(54.dp)
                     .testTag("save_sale_button"),
                 shape = RoundedCornerShape(16.dp)
             ) {
-                Icon(imageVector = Icons.Default.CheckCircle, contentDescription = "Save Sale")
+                Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null)
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = if (editingEntry == null) {
-                        "Save Sale (${TomanFormatter.formatGb(totalAllocatedGb)} • ${TomanFormatter.format(parsedPrice)})"
-                    } else {
-                        "Update Sale (${TomanFormatter.formatGb(totalAllocatedGb)} • ${TomanFormatter.format(parsedPrice)})"
-                    },
+                    text = if (editingEntry == null) "Save sale" else "Update sale",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
@@ -913,18 +886,37 @@ fun SaleEntrySheet(
 }
 
 @Composable
+private fun PreviewLine(label: String, value: String) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+@Composable
 fun ResetLedgerDialog(
     bookTitle: String,
     metrics: LedgerSummaryMetrics,
+    isSellerBook: Boolean,
     onDismiss: () -> Unit,
     onConfirmReset: (cycleTitle: String, keepArchive: Boolean) -> Unit
 ) {
     val defaultCycleName = remember {
         val fmt = SimpleDateFormat("MMM dd, yyyy", Locale.US)
-        "Cycle • ${fmt.format(Date())}"
+        "Cycle ending ${fmt.format(Date())}"
     }
     var cycleTitle by rememberSaveable { mutableStateOf(defaultCycleName) }
     var keepArchive by rememberSaveable { mutableStateOf(true) }
+    // DATA-02: The limit is stated before anything is changed; nothing is ever truncated.
     val exceedsArchiveCap = metrics.totalCustomers > LedgerRepository.MAX_ARCHIVE_ITEMS
 
     AlertDialog(
@@ -932,38 +924,31 @@ fun ResetLedgerDialog(
         icon = {
             Icon(
                 imageVector = Icons.Default.RestartAlt,
-                contentDescription = "Reset Ledger",
+                contentDescription = null,
                 tint = MaterialTheme.colorScheme.error,
                 modifier = Modifier.size(32.dp)
             )
         },
         title = {
             Text(
-                text = "Reset & Clear Active Ledger?",
+                text = "Start a new cycle?",
                 style = MaterialTheme.typography.titleLarge
             )
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Text(
-                    text = "This will clear all ${metrics.totalCustomers} sales and reset the gross sales total (${TomanFormatter.format(metrics.totalSalesToman)}) to 0 Toman for $bookTitle.",
+                    text = "This closes the current cycle of $bookTitle (${salesCountLabel(metrics.totalCustomers)}, ${TomanFormatter.format(metrics.totalSalesToman)}) and starts again from zero.",
                     style = MaterialTheme.typography.bodyMedium
                 )
 
-                if (keepArchive && exceedsArchiveCap) {
-                    Card(
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.errorContainer
-                        ),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text(
-                            text = "This ledger has ${metrics.totalCustomers} sales, which exceeds the ${LedgerRepository.MAX_ARCHIVE_ITEMS}-sale archive snapshot limit. Export a PDF first or reduce entries before archiving.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            modifier = Modifier.padding(12.dp)
-                        )
-                    }
+                if (exceedsArchiveCap) {
+                    InlineWarning(
+                        "This cycle has ${metrics.totalCustomers} sales, over the ${LedgerRepository.MAX_ARCHIVE_ITEMS}-sale limit. Nothing will be changed. Export a PDF first and contact the developer."
+                    )
                 }
 
                 Card(
@@ -987,11 +972,11 @@ fun ResetLedgerDialog(
                             Spacer(modifier = Modifier.width(6.dp))
                             Column {
                                 Text(
-                                    text = "Save snapshot to Archives",
+                                    text = "Save this cycle to Archives",
                                     style = MaterialTheme.typography.titleSmall
                                 )
                                 Text(
-                                    text = "Keep a full record for PDF export & inspection",
+                                    text = "Recommended. Keeps every sale for viewing and PDF export.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -1002,12 +987,23 @@ fun ResetLedgerDialog(
                             Spacer(modifier = Modifier.height(8.dp))
                             OutlinedTextField(
                                 value = cycleTitle,
-                                onValueChange = { cycleTitle = it },
-                                label = { Text("Archive Cycle Name") },
+                                onValueChange = { cycleTitle = it.take(120) },
+                                label = { Text("Archive name") },
                                 singleLine = true,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .testTag("archive_cycle_title_input")
+                            )
+                        } else {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = if (isSellerBook) {
+                                    "Without an archive these sales disappear from your app. Reports you already sent to the Admin are kept."
+                                } else {
+                                    "Without an archive these sales disappear from the app."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
                             )
                         }
                     }
@@ -1017,14 +1013,14 @@ fun ResetLedgerDialog(
         confirmButton = {
             Button(
                 onClick = { onConfirmReset(cycleTitle, keepArchive) },
-                enabled = !(keepArchive && exceedsArchiveCap),
+                enabled = !exceedsArchiveCap,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError
                 ),
                 modifier = Modifier.testTag("confirm_reset_ledger_button")
             ) {
-                Text(if (keepArchive) "Archive & Reset to 0" else "Wipe Without Archive")
+                Text("Start new cycle")
             }
         },
         dismissButton = {
@@ -1045,10 +1041,14 @@ fun PdfExportReadyDialog(
     onSharePdf: () -> Unit
 ) {
     val payload = exportReady.payload
-    val settlementLabel = if (payload.isPrivateAdminBook) {
-        "ADMIN INFRA + SHARE"
-    } else {
-        "AMOUNT SELLER PAYS ADMIN"
+    val metrics = remember(payload) {
+        LedgerSummaryMetrics(
+            totalSalesToman = payload.totalSalesToman,
+            totalGb = payload.totalGb,
+            totalCustomers = payload.rows.size,
+            costPerGbToman = payload.costPerGbToman,
+            adminProfitPercent = payload.adminProfitPercent
+        )
     }
 
     AlertDialog(
@@ -1056,14 +1056,14 @@ fun PdfExportReadyDialog(
         icon = {
             Icon(
                 imageVector = Icons.Default.PictureAsPdf,
-                contentDescription = "Graphical PDF Ready",
+                contentDescription = null,
                 tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(36.dp)
             )
         },
         title = {
             Text(
-                text = "NodeSplit PDF Report Ready",
+                text = "PDF ready",
                 style = MaterialTheme.typography.titleLarge
             )
         },
@@ -1072,107 +1072,13 @@ fun PdfExportReadyDialog(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // Top of Export Section: Stacked Settlement Summary (no horizontal clipping)
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
-                    ),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(
-                            text = "EXPORT SETTLEMENT SUMMARY",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                            fontWeight = FontWeight.Bold
-                        )
-
-                        StackedDialogMetricBlock(
-                            label = "Gross Sales (${payload.rows.size} sales)",
-                            value = TomanFormatter.format(payload.totalSalesToman)
-                        )
-                        StackedDialogMetricBlock(
-                            label = "Total Allocated Data",
-                            value = "${TomanFormatter.formatGb(payload.totalGb)} (Rate: ${TomanFormatter.format(payload.costPerGbToman)}/GB)"
-                        )
-                        StackedDialogMetricBlock(
-                            label = "1. Infrastructure Cost",
-                            value = TomanFormatter.format(payload.infraCostToman)
-                        )
-                        StackedDialogMetricBlock(
-                            label = "Net Profit",
-                            value = TomanFormatter.format(payload.netProfitToman)
-                        )
-                        StackedDialogMetricBlock(
-                            label = "2. Seller Profit (${payload.sellerProfitPercent}%)",
-                            value = TomanFormatter.format(payload.sellerProfitToman),
-                            valueColor = MaterialTheme.colorScheme.secondary
-                        )
-                        StackedDialogMetricBlock(
-                            label = "3. Admin Profit (${payload.adminProfitPercent}%)",
-                            value = TomanFormatter.format(payload.adminProfitToman),
-                            valueColor = MaterialTheme.colorScheme.primary
-                        )
-
-                        HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
-
-                        Surface(
-                            color = MaterialTheme.colorScheme.primaryContainer,
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
-                            ) {
-                                Text(
-                                    text = settlementLabel,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = TomanFormatter.format(payload.sellerPayableToAdminToman),
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "Admin Profit (${TomanFormatter.format(payload.adminProfitToman)}) + Infra Cost (${TomanFormatter.format(payload.infraCostToman)})",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
-                                )
-                            }
-                        }
-                    }
-                }
-
+                GrossSalesHeader(metrics)
+                FinancialBreakdownSection(metrics = metrics, isPrivateAdminBook = payload.isPrivateAdminBook)
                 Text(
-                    text = "Choose whether to save a copy to device storage, open in a PDF viewer, or share directly.",
+                    text = "Save a copy, open it in a PDF viewer, or share it.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = exportReady.file.name,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(10.dp)
-                    )
-                }
-
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1184,7 +1090,7 @@ fun PdfExportReadyDialog(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Download,
-                            contentDescription = "Save PDF",
+                            contentDescription = null,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
@@ -1196,11 +1102,11 @@ fun PdfExportReadyDialog(
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.OpenInNew,
-                            contentDescription = "Open PDF",
+                            contentDescription = null,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Open PDF")
+                        Text("Open")
                     }
                     OutlinedButton(
                         onClick = onSharePdf,
@@ -1208,11 +1114,11 @@ fun PdfExportReadyDialog(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Share,
-                            contentDescription = "Share PDF",
+                            contentDescription = null,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Share PDF")
+                        Text("Share")
                     }
                 }
             }
@@ -1226,81 +1132,70 @@ fun PdfExportReadyDialog(
     )
 }
 
-@Composable
-private fun StackedDialogMetricBlock(
-    label: String,
-    value: String,
-    valueColor: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.onSurface
-) {
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.bodyMedium,
-            color = valueColor,
-            fontWeight = FontWeight.Bold
-        )
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * UI-03: Detail sheet for a closed cycle or a sent report. Header lines are separate, the close
+ * button keeps its own touch target, money is stacked, and actions wrap instead of squeezing.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ArchiveDetailBottomSheet(
     archive: LedgerArchive,
     fallbackCostPerGbToman: Long = 1_000L,
     fallbackAdminProfitPercent: Int = 50,
     isPrivateAdminBook: Boolean = false,
+    isAdmin: Boolean = false,
     onDismiss: () -> Unit,
-    onToggleItemPaid: (itemIndex: Int, newPaid: Boolean) -> Unit,
+    onToggleItemPaid: (itemId: String, newPaid: Boolean) -> Unit,
     onExportPdf: (LedgerArchive) -> Unit,
-    onDeleteArchive: (LedgerArchive) -> Unit
+    onVoidArchive: (LedgerArchive, String) -> Unit,
+    onSetSettled: (LedgerArchive, Boolean) -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val items: List<ArchivedSaleItem> = remember(archive) { archive.parsedItems() }
     val archiveMetrics = remember(archive, fallbackCostPerGbToman, fallbackAdminProfitPercent) {
         archive.computeMetrics(fallbackCostPerGbToman, fallbackAdminProfitPercent)
     }
-    val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy • HH:mm", Locale.US) }
-    val closedDate = archive.createdAt?.toDate()?.let { dateFormat.format(it) } ?: "Archived"
+    val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy 'at' HH:mm", Locale.US) }
+    val dateText = archive.createdAt?.toDate()?.let { dateFormat.format(it) }
     val cleanOwner = TomanFormatter.sanitizeOwnerDisplayName(archive.ownerName)
-    var showDeleteConfirm by remember { mutableStateOf(false) }
+    val isReport = archive.isSubmission || archive.isLegacyReport
+    val paymentEditable = !archive.isVoided && !archive.isLegacyReport
+    var showVoidDialog by rememberSaveable(archive.id) { mutableStateOf(false) }
+    var voidReason by rememberSaveable(archive.id) { mutableStateOf("") }
 
-    val settlementLabel = if (isPrivateAdminBook) {
-        "ADMIN INFRA + SHARE"
-    } else {
-        "AMOUNT SELLER PAYS ADMIN"
-    }
-
-    if (showDeleteConfirm) {
+    if (showVoidDialog) {
         AlertDialog(
-            onDismissRequest = { showDeleteConfirm = false },
-            title = { Text("Delete Archived Snapshot?") },
+            onDismissRequest = { showVoidDialog = false },
+            title = { Text("Void this archive?") },
             text = {
-                Text(
-                    "Are you sure you want to permanently delete \"${archive.cycleTitle}\" (${items.size} sales • ${TomanFormatter.format(archive.totalSalesToman)})?"
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("It stays in Archives, marked as voided, with its sales and totals unchanged. This can't be undone.")
+                    OutlinedTextField(
+                        value = voidReason,
+                        onValueChange = { voidReason = it.take(300) },
+                        label = { Text("Reason") },
+                        supportingText = { Text("At least 3 characters") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        showDeleteConfirm = false
-                        onDeleteArchive(archive)
-                        onDismiss()
+                        showVoidDialog = false
+                        onVoidArchive(archive, voidReason.trim())
                     },
+                    enabled = voidReason.trim().length >= 3,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.error,
                         contentColor = MaterialTheme.colorScheme.onError
                     )
                 ) {
-                    Text("Delete Archive")
+                    Text("Void")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showDeleteConfirm = false }) {
+                TextButton(onClick = { showVoidDialog = false }) {
                     Text("Cancel")
                 }
             }
@@ -1312,7 +1207,7 @@ fun ArchiveDetailBottomSheet(
         sheetState = sheetState,
         containerColor = MaterialTheme.colorScheme.surface
     ) {
-        // UI-03: Single LazyColumn for the entire sheet so all summary metrics and rows scroll together cleanly
+        // UI-03: One LazyColumn for the whole sheet so the summary, actions and rows scroll together.
         LazyColumn(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1320,53 +1215,45 @@ fun ArchiveDetailBottomSheet(
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // 1. Sheet Header
             item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.Top
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Archive,
-                                contentDescription = "Archive",
-                                tint = MaterialTheme.colorScheme.secondary,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Text(
-                                text = archive.cycleTitle,
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
                         Text(
-                            text = "$cleanOwner • Closed $closedDate",
+                            text = when {
+                                archive.isLegacyReport -> "Older report"
+                                archive.isSubmission -> "Report"
+                                else -> archive.cycleTitle
+                            },
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = cleanOwner,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = when {
+                                archive.hasPendingSync -> "Saved on this phone, waiting to upload"
+                                dateText == null -> "Date not available"
+                                isReport -> "Uploaded $dateText"
+                                else -> "Closed $dateText"
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        if (archive.hasPendingSync) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                modifier = Modifier.padding(top = 4.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.CloudQueue,
-                                    contentDescription = "Pending cloud sync",
-                                    tint = MaterialTheme.colorScheme.tertiary,
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Text(
-                                    text = "Saved locally — waiting to sync",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.tertiary
-                                )
-                            }
+                        if (archive.isSettled) {
+                            Text(
+                                text = "Settled by the Admin",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary
+                            )
                         }
                     }
                     IconButton(onClick = onDismiss) {
@@ -1375,37 +1262,24 @@ fun ArchiveDetailBottomSheet(
                 }
             }
 
-            // 1B. Warning if malformed items were detected (DATA-03)
+            if (archive.isVoided) {
+                item {
+                    InlineWarning(
+                        "Voided${archive.voidReason.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}. Kept for the record; it can't be edited."
+                    )
+                }
+            }
+            if (archive.isLegacyReport) {
+                item {
+                    InlineWarning("Sent with an earlier app version. It is read-only and its history was not kept.")
+                }
+            }
             if (archive.malformedItemCount > 0) {
                 item {
-                    Card(
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.errorContainer
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.WarningAmber,
-                                contentDescription = "Data warning",
-                                tint = MaterialTheme.colorScheme.onErrorContainer
-                            )
-                            Text(
-                                text = "${archive.malformedItemCount} corrupted sale record(s) in this archive were skipped.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer
-                            )
-                        }
-                    }
+                    InlineWarning("${archive.malformedItemCount} damaged sale record(s) in this archive could not be read and are not counted.")
                 }
             }
 
-            // 2. Vertical Stacked Summary Card (UI-01 / UI-03)
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -1416,147 +1290,73 @@ fun ArchiveDetailBottomSheet(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Column(modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                text = "GROSS SALES (${items.size} SALES)",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = TomanFormatter.format(archiveMetrics.totalSalesToman),
-                                style = MaterialTheme.typography.titleLarge,
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-
-                        Column(modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                text = "TOTAL ALLOCATED DATA",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "${TomanFormatter.formatGb(archiveMetrics.totalGb)} • Rate: ${TomanFormatter.format(archiveMetrics.costPerGbToman)}/GB",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
-
-                        ArchiveMetricBlock(
-                            title = "1. Infrastructure Cost",
-                            amount = TomanFormatter.format(archiveMetrics.infraCostToman),
-                            subtitle = "${TomanFormatter.formatGb(archiveMetrics.totalGb)} × ${TomanFormatter.format(archiveMetrics.costPerGbToman)}",
-                            amountColor = MaterialTheme.colorScheme.onSurface
+                        GrossSalesHeader(archiveMetrics)
+                        FinancialBreakdownSection(
+                            metrics = archiveMetrics,
+                            isPrivateAdminBook = isPrivateAdminBook,
+                            ratesNote = "Rates saved with this record: ${ratesLabel(archiveMetrics)}"
                         )
-
-                        ArchiveMetricBlock(
-                            title = "Net Profit",
-                            amount = TomanFormatter.format(archiveMetrics.netProfitToman),
-                            subtitle = "Gross Sales minus Infrastructure Cost",
-                            amountColor = MaterialTheme.colorScheme.onSurface
-                        )
-
-                        ArchiveMetricBlock(
-                            title = "2. Seller Profit (${archiveMetrics.sellerProfitPercent}%)",
-                            amount = TomanFormatter.format(archiveMetrics.sellerProfitToman),
-                            subtitle = "Seller Net Profit Share",
-                            amountColor = MaterialTheme.colorScheme.secondary
-                        )
-
-                        ArchiveMetricBlock(
-                            title = "3. Admin Profit (${archiveMetrics.adminProfitPercent}%)",
-                            amount = TomanFormatter.format(archiveMetrics.adminProfitToman),
-                            subtitle = "Admin Net Profit Share",
-                            amountColor = MaterialTheme.colorScheme.primary
-                        )
-
-                        Surface(
-                            color = MaterialTheme.colorScheme.primaryContainer,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
-                            ) {
-                                Text(
-                                    text = settlementLabel,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = TomanFormatter.format(archiveMetrics.sellerPayableToAdminToman),
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "Admin Profit (${TomanFormatter.format(archiveMetrics.adminProfitToman)}) + Infra Cost (${TomanFormatter.format(archiveMetrics.infraCostToman)})",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
-                                )
-                            }
-                        }
                     }
                 }
             }
 
-            // 3. Action Buttons
             item {
-                Row(
+                FlowRow(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Button(
                         onClick = { onExportPdf(archive) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("archive_sheet_export_pdf_button"),
+                        modifier = Modifier.testTag("archive_sheet_export_pdf_button"),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.PictureAsPdf, contentDescription = "Export PDF")
+                        Icon(imageVector = Icons.Default.PictureAsPdf, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Export PDF Report")
+                        Text("Export PDF")
                     }
-                    OutlinedButton(
-                        onClick = { showDeleteConfirm = true },
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = MaterialTheme.colorScheme.error
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.testTag("archive_sheet_delete_button")
-                    ) {
-                        Icon(imageVector = Icons.Default.DeleteOutline, contentDescription = "Delete Archive")
+                    if (archive.isSubmission && isAdmin) {
+                        OutlinedButton(
+                            onClick = { onSetSettled(archive, !archive.isSettled) },
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text(if (archive.isSettled) "Mark not settled" else "Mark settled")
+                        }
+                    }
+                    if (!isReport && !archive.isVoided) {
+                        OutlinedButton(
+                            onClick = { showVoidDialog = true },
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.testTag("archive_sheet_void_button")
+                        ) {
+                            Text("Void…")
+                        }
                     }
                 }
             }
 
             item {
                 HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-                Text(
-                    text = "Archived Sales (${items.size}) — Tap Checkbox to Toggle Paid/Unpaid",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold
-                )
+                SectionHeading("Sales (${items.size})")
+                if (paymentEditable) {
+                    Text(
+                        text = "Tick a sale when the customer has paid. Totals don't change.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
 
-            // 4. Archived Sale Rows
             itemsIndexed(items, key = { idx, item -> "${idx}_${item.id}" }) { idx, item ->
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onToggleItemPaid(idx, !item.isPaid) },
+                        .clickable(enabled = paymentEditable) { onToggleItemPaid(item.itemId, !item.isPaid) },
                     colors = CardDefaults.cardColors(
                         containerColor = if (item.isPaid) {
                             MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
@@ -1574,129 +1374,82 @@ fun ArchiveDetailBottomSheet(
                     ),
                     shape = RoundedCornerShape(12.dp)
                 ) {
-                    Column(
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 10.dp, vertical = 10.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                        verticalAlignment = Alignment.Top
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
+                        Box(
+                            modifier = Modifier.minimumInteractiveComponentSize(),
+                            contentAlignment = Alignment.Center
                         ) {
-                            Box(
-                                modifier = Modifier.minimumInteractiveComponentSize(),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Checkbox(
-                                    checked = item.isPaid,
-                                    onCheckedChange = { checked -> onToggleItemPaid(idx, checked) },
-                                    colors = CheckboxDefaults.colors(
-                                        checkedColor = MaterialTheme.colorScheme.primary,
-                                        uncheckedColor = MaterialTheme.colorScheme.tertiary
-                                    ),
-                                    modifier = Modifier.testTag("archive_paid_checkbox_$idx")
+                            Checkbox(
+                                checked = item.isPaid,
+                                onCheckedChange = { checked -> onToggleItemPaid(item.itemId, checked) },
+                                enabled = paymentEditable,
+                                colors = CheckboxDefaults.colors(
+                                    checkedColor = MaterialTheme.colorScheme.primary,
+                                    uncheckedColor = MaterialTheme.colorScheme.tertiary
+                                ),
+                                modifier = Modifier
+                                    .semantics {
+                                        contentDescription = "Customer paid: ${item.customerName}"
+                                        stateDescription = if (item.isPaid) "Paid" else "Not paid yet"
+                                    }
+                                    .testTag("archive_paid_checkbox_$idx")
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "${idx + 1}. ${item.customerName}",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            if (item.isNewUser) {
+                                Text(
+                                    text = "New user",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.secondary
                                 )
                             }
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Text(
-                                        text = "${idx + 1}. ${item.customerName}",
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    if (item.isNewUser) {
-                                        Surface(
-                                            color = MaterialTheme.colorScheme.secondaryContainer,
-                                            shape = RoundedCornerShape(6.dp)
-                                        ) {
-                                            val bonusTxt = if (item.bonusGb > 0.0) "+${TomanFormatter.formatGb(item.bonusGb)}" else "NEW"
-                                            Text(
-                                                text = "NEW USER ($bonusTxt)",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                                fontWeight = FontWeight.Bold,
-                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                                val gbText = if (item.isNewUser && item.bonusGb > 0.0) {
-                                    "${TomanFormatter.formatGbNumberOnly(item.dataGb)} GB total (${TomanFormatter.formatGbNumberOnly(item.baseDataGb)} + ${TomanFormatter.formatGbNumberOnly(item.bonusGb)} bonus)"
-                                } else {
-                                    TomanFormatter.formatGb(item.dataGb)
-                                }
+                            Text(
+                                text = TomanFormatter.formatAllocationSummary(item.safeDataGb, item.safeBonusGb, item.isNewUser),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = item.presetName.ifBlank { "Custom plan" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            if (item.note.isNotBlank()) {
                                 Text(
-                                    text = "$gbText • ${item.presetName.ifBlank { "Custom Plan" }}",
+                                    text = item.note,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                                if (item.note.isNotBlank()) {
-                                    Text(
-                                        text = item.note,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                Text(
-                                    text = TomanFormatter.format(item.priceToman),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = if (item.isPaid) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.tertiary
-                                    },
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(top = 2.dp)
-                                )
                             }
+                            Text(
+                                text = TomanFormatter.format(item.priceToman),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(top = 2.dp)
+                            )
+                            Text(
+                                text = if (item.isPaid) "Paid" else "Not paid yet",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (item.isPaid) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary
+                            )
                         }
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun ArchiveMetricBlock(
-    title: String,
-    amount: String,
-    subtitle: String,
-    amountColor: androidx.compose.ui.graphics.Color
-) {
-    Surface(
-        color = MaterialTheme.colorScheme.surface,
-        shape = RoundedCornerShape(10.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(
-                text = amount,
-                style = MaterialTheme.typography.titleSmall,
-                color = amountColor,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
     }
 }

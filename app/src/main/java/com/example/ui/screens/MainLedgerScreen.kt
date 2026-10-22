@@ -87,9 +87,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
@@ -104,18 +106,26 @@ import com.example.data.model.TomanFormatter
 import com.example.data.model.UserProfile
 import com.example.data.model.WorkspaceConfig
 import com.example.ui.components.ArchiveDetailBottomSheet
+import com.example.ui.components.FinancialBreakdownSection
+import com.example.ui.components.GrossSalesHeader
+import com.example.ui.components.InlineWarning
+import com.example.ui.components.MetadataLine
+import com.example.ui.components.MetricBlock
 import com.example.ui.components.PdfExportReadyDialog
 import com.example.ui.components.ResetLedgerDialog
 import com.example.ui.components.SaleEntrySheet
+import com.example.ui.components.SectionHeading
+import com.example.ui.components.ratesLabel
+import com.example.ui.components.salesCountLabel
 import com.example.ui.viewmodel.LedgerViewModel
 import com.example.util.GraphicalPdfExporter
 import java.text.SimpleDateFormat
 import java.util.Locale
 
 private enum class NodeSplitTab(val label: String) {
-    LEDGER("Active Ledger"),
+    LEDGER("Sales"),
     ARCHIVES("Archives"),
-    ADMIN_SETTINGS("Admin & Split")
+    ADMIN_SETTINGS("Settings")
 }
 
 private fun formatGbPlainText(gb: Double): String {
@@ -140,6 +150,8 @@ fun MainLedgerScreen(
     val rawEntries by viewModel.rawEntries.collectAsStateWithLifecycle()
     val metrics by viewModel.summaryMetrics.collectAsStateWithLifecycle()
     val archives by viewModel.archives.collectAsStateWithLifecycle()
+    val submissionHistory by viewModel.submissionHistory.collectAsStateWithLifecycle()
+    val latestReport by viewModel.submittedListSnapshot.collectAsStateWithLifecycle()
     val presets by viewModel.allPresets.collectAsStateWithLifecycle()
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val bannerMessage by viewModel.statusBannerMessage.collectAsStateWithLifecycle()
@@ -149,10 +161,14 @@ fun MainLedgerScreen(
     val hasPendingSyncWrites by viewModel.hasPendingSyncWrites.collectAsStateWithLifecycle()
     val workspaceUsers by viewModel.workspaceUsers.collectAsStateWithLifecycle()
     val approvedEmails by viewModel.approvedEmails.collectAsStateWithLifecycle()
+    val ledgerLoadError by viewModel.ledgerLoadError.collectAsStateWithLifecycle()
+    val archiveLoadError by viewModel.archiveLoadError.collectAsStateWithLifecycle()
+    val isBookLoaded by viewModel.isSelectedBookLoaded.collectAsStateWithLifecycle()
 
     val savePdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { uri ->
+        // A null uri means the user cancelled the picker: no error message.
         if (uri != null) {
             viewModel.saveExportedPdfToUri(context, uri)
         }
@@ -179,17 +195,20 @@ fun MainLedgerScreen(
     }
 
     var pendingDeleteSale by remember { mutableStateOf<SaleEntry?>(null) }
-    var pendingDeleteArchive by remember { mutableStateOf<LedgerArchive?>(null) }
     var showResetDialog by rememberSaveable { mutableStateOf(false) }
+    var showSignOutWarning by rememberSaveable { mutableStateOf(false) }
     var inspectedArchiveId by rememberSaveable { mutableStateOf<String?>(null) }
     var bookMenuExpanded by remember { mutableStateOf(false) }
     var overflowMenuExpanded by remember { mutableStateOf(false) }
 
-    val inspectedArchive = remember(archives, inspectedArchiveId) {
+    val inspectedArchive = remember(archives, submissionHistory, latestReport, inspectedArchiveId) {
         archives.firstOrNull { it.id == inspectedArchiveId }
+            ?: submissionHistory.firstOrNull { it.id == inspectedArchiveId }
+            ?: latestReport?.takeIf { it.id == inspectedArchiveId }
     }
 
     val isAdminInspectingSeller = profile.isAdmin && currentBook.ownerUid != profile.userId
+    val canStartNewCycle = !isAdminInspectingSeller && rawEntries.isNotEmpty() && isBookLoaded && !isBusy
 
     LaunchedEffect(bannerMessage) {
         bannerMessage?.let { msg ->
@@ -201,10 +220,10 @@ fun MainLedgerScreen(
     pendingDeleteSale?.let { entryToDelete ->
         AlertDialog(
             onDismissRequest = { pendingDeleteSale = null },
-            title = { Text("Delete Sale Record?") },
+            title = { Text("Delete this sale?") },
             text = {
                 Text(
-                    "Are you sure you want to delete the sale for \"${entryToDelete.customerName}\" (${TomanFormatter.formatGb(entryToDelete.dataGb)} • ${TomanFormatter.format(entryToDelete.priceToman)})?"
+                    "\"${entryToDelete.customerName}\" — ${TomanFormatter.formatGb(entryToDelete.dataGb)}, ${TomanFormatter.format(entryToDelete.priceToman)}. Reports you already sent to the Admin keep their copy."
                 )
             },
             confirmButton = {
@@ -219,7 +238,7 @@ fun MainLedgerScreen(
                     ),
                     modifier = Modifier.testTag("confirm_delete_sale_button")
                 ) {
-                    Text("Delete Sale")
+                    Text("Delete")
                 }
             },
             dismissButton = {
@@ -230,36 +249,27 @@ fun MainLedgerScreen(
         )
     }
 
-    pendingDeleteArchive?.let { archiveToDelete ->
+    // OFF-06: Unsynced changes stay on this phone for this account; say so before signing out.
+    if (showSignOutWarning) {
         AlertDialog(
-            onDismissRequest = { pendingDeleteArchive = null },
-            title = { Text("Delete Archived Snapshot?") },
+            onDismissRequest = { showSignOutWarning = false },
+            title = { Text("Some changes haven't uploaded yet") },
             text = {
-                Text(
-                    "Are you sure you want to permanently delete \"${archiveToDelete.cycleTitle}\" (${TomanFormatter.format(archiveToDelete.totalSalesToman)})?"
-                )
+                Text("They stay on this phone and upload the next time you sign in here with this account and are online. If you sign out and uninstall or clear the app's data, they are lost.")
             },
             confirmButton = {
-                Button(
+                TextButton(
                     onClick = {
-                        viewModel.deleteArchiveSnapshot(archiveToDelete)
-                        if (inspectedArchiveId == archiveToDelete.id) {
-                            inspectedArchiveId = null
-                        }
-                        pendingDeleteArchive = null
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                        contentColor = MaterialTheme.colorScheme.onError
-                    ),
-                    modifier = Modifier.testTag("confirm_delete_archive_button")
+                        showSignOutWarning = false
+                        onSignOut()
+                    }
                 ) {
-                    Text("Delete Archive")
+                    Text("Sign out anyway")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { pendingDeleteArchive = null }) {
-                    Text("Cancel")
+                Button(onClick = { showSignOutWarning = false }) {
+                    Text("Stay signed in")
                 }
             }
         )
@@ -273,67 +283,44 @@ fun MainLedgerScreen(
             Column {
                 TopAppBar(
                     title = {
-                        Column {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = stringResource(R.string.app_name),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Surface(
+                                color = if (profile.isAdmin) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                },
+                                shape = RoundedCornerShape(8.dp)
                             ) {
                                 Text(
-                                    text = stringResource(R.string.app_name),
-                                    style = MaterialTheme.typography.titleLarge,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Surface(
+                                    text = if (profile.isAdmin) "Admin" else "Seller",
+                                    style = MaterialTheme.typography.labelMedium,
                                     color = if (profile.isAdmin) {
-                                        MaterialTheme.colorScheme.primaryContainer
+                                        MaterialTheme.colorScheme.onPrimaryContainer
                                     } else {
-                                        MaterialTheme.colorScheme.secondaryContainer
+                                        MaterialTheme.colorScheme.onSecondaryContainer
                                     },
-                                    shape = RoundedCornerShape(8.dp)
-                                ) {
-                                    Text(
-                                        text = if (profile.isAdmin) "ADMIN" else "SELLER",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (profile.isAdmin) {
-                                            MaterialTheme.colorScheme.onPrimaryContainer
-                                        } else {
-                                            MaterialTheme.colorScheme.onSecondaryContainer
-                                        },
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
-                                    )
-                                }
-                            }
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Text(
-                                    text = currentBook.title,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Icon(
-                                    imageVector = if (hasPendingSyncWrites) Icons.Default.CloudQueue else Icons.Default.CloudDone,
-                                    contentDescription = if (hasPendingSyncWrites) "Pending local changes" else "Synced",
-                                    tint = if (hasPendingSyncWrites) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(14.dp)
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
                                 )
                             }
+                            Icon(
+                                imageVector = if (hasPendingSyncWrites) Icons.Default.CloudQueue else Icons.Default.CloudDone,
+                                contentDescription = if (hasPendingSyncWrites) "Waiting to sync" else "Synced",
+                                tint = if (hasPendingSyncWrites) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
                         }
                     },
                     actions = {
-                        IconButton(
-                            onClick = { viewModel.exportActiveLedgerToPdf(context) },
-                            modifier = Modifier.testTag("top_bar_export_pdf_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.PictureAsPdf,
-                                contentDescription = "Export Graphical PDF"
-                            )
-                        }
                         Box {
                             IconButton(
                                 onClick = { overflowMenuExpanded = true },
@@ -341,7 +328,7 @@ fun MainLedgerScreen(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.MoreVert,
-                                    contentDescription = "More Options"
+                                    contentDescription = "More options"
                                 )
                             }
                             DropdownMenu(
@@ -349,18 +336,19 @@ fun MainLedgerScreen(
                                 onDismissRequest = { overflowMenuExpanded = false }
                             ) {
                                 DropdownMenuItem(
-                                    text = { Text("Export Graphical PDF") },
+                                    text = { Text("Export PDF") },
                                     leadingIcon = {
                                         Icon(Icons.Default.PictureAsPdf, contentDescription = null)
                                     },
+                                    enabled = isBookLoaded && !isBusy,
                                     onClick = {
                                         overflowMenuExpanded = false
                                         viewModel.exportActiveLedgerToPdf(context)
                                     }
                                 )
-                                if (!isAdminInspectingSeller && rawEntries.isNotEmpty()) {
+                                if (canStartNewCycle) {
                                     DropdownMenuItem(
-                                        text = { Text("Reset & Archive Ledger") },
+                                        text = { Text("Start new cycle") },
                                         leadingIcon = {
                                             Icon(Icons.Default.RestartAlt, contentDescription = null)
                                         },
@@ -372,10 +360,10 @@ fun MainLedgerScreen(
                                 }
                                 HorizontalDivider()
                                 DropdownMenuItem(
-                                    text = { Text("Sign Out") },
+                                    text = { Text("Sign out") },
                                     onClick = {
                                         overflowMenuExpanded = false
-                                        onSignOut()
+                                        if (hasPendingSyncWrites) showSignOutWarning = true else onSignOut()
                                     }
                                 )
                             }
@@ -385,6 +373,19 @@ fun MainLedgerScreen(
                         containerColor = MaterialTheme.colorScheme.surface
                     )
                 )
+                // UI-02: The selected book gets its own full-width line instead of a truncated subtitle.
+                Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        text = if (currentBook.isPrivateAdminBook || !profile.isAdmin) {
+                            currentBook.title
+                        } else {
+                            "Seller: ${currentBook.title}"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 6.dp)
+                    )
+                }
                 if (isBusy) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
@@ -403,7 +404,7 @@ fun MainLedgerScreen(
                                     NodeSplitTab.ARCHIVES -> Icons.Default.Archive
                                     NodeSplitTab.ADMIN_SETTINGS -> Icons.Default.AdminPanelSettings
                                 },
-                                contentDescription = tab.label
+                                contentDescription = null
                             )
                         },
                         label = { Text(tab.label) },
@@ -419,8 +420,8 @@ fun MainLedgerScreen(
                         editingSaleEntryId = null
                         showSaleSheet = true
                     },
-                    icon = { Icon(Icons.Default.Add, contentDescription = "Add VPN Sale") },
-                    text = { Text("Add VPN Sale") },
+                    icon = { Icon(Icons.Default.Add, contentDescription = null) },
+                    text = { Text("Add sale") },
                     containerColor = MaterialTheme.colorScheme.primary,
                     contentColor = MaterialTheme.colorScheme.onPrimary,
                     modifier = Modifier.testTag("add_sale_fab")
@@ -444,6 +445,10 @@ fun MainLedgerScreen(
                         viewModel.selectLedgerBook(uid)
                     },
                     isAdminInspectingSeller = isAdminInspectingSeller,
+                    isBookLoaded = isBookLoaded,
+                    isBusy = isBusy,
+                    ledgerLoadError = ledgerLoadError,
+                    onRetryLoad = viewModel::refreshListeners,
                     hasPendingSyncWrites = hasPendingSyncWrites,
                     metrics = metrics,
                     rawEntriesCount = rawEntries.size,
@@ -451,9 +456,11 @@ fun MainLedgerScreen(
                     searchQuery = searchQuery,
                     onSearchQueryChange = viewModel::updateSearchQuery,
                     lastSentToAdminFormatted = lastSentToAdminFormatted,
+                    isLegacyReport = latestReport?.isLegacyReport == true,
                     onSendListToAdmin = viewModel::sendCurrentListToAdmin,
                     onExportPdf = { viewModel.exportActiveLedgerToPdf(context) },
                     onOpenResetDialog = { showResetDialog = true },
+                    canStartNewCycle = canStartNewCycle,
                     onTogglePaid = viewModel::togglePaidStatus,
                     onEditEntry = { entry ->
                         if (!isAdminInspectingSeller) {
@@ -475,11 +482,14 @@ fun MainLedgerScreen(
                         .fillMaxSize()
                         .padding(innerPadding),
                     archives = archives,
+                    reports = submissionHistory,
+                    archiveLoadError = archiveLoadError,
                     workspace = workspace,
                     currentBook = currentBook,
+                    isAdmin = profile.isAdmin,
+                    isBusy = isBusy,
                     onInspectArchive = { archive -> inspectedArchiveId = archive.id },
-                    onExportArchivePdf = { archive -> viewModel.exportArchiveToPdf(context, archive) },
-                    onDeleteArchive = { archive -> pendingDeleteArchive = archive }
+                    onExportArchivePdf = { archive -> viewModel.exportArchiveToPdf(context, archive) }
                 )
             }
 
@@ -511,6 +521,7 @@ fun MainLedgerScreen(
             costPerGbToman = metrics.costPerGbToman,
             adminProfitPercent = metrics.adminProfitPercent,
             isPrivateAdminBook = currentBook.isPrivateAdminBook,
+            isSaving = isBusy,
             onDismiss = {
                 showSaleSheet = false
                 editingSaleEntryId = null
@@ -542,6 +553,7 @@ fun MainLedgerScreen(
         ResetLedgerDialog(
             bookTitle = currentBook.title,
             metrics = metrics,
+            isSellerBook = !currentBook.isPrivateAdminBook,
             onDismiss = { showResetDialog = false },
             onConfirmReset = { cycleTitle, keepArchive ->
                 viewModel.resetCurrentLedger(
@@ -553,23 +565,20 @@ fun MainLedgerScreen(
         )
     }
 
-    if (inspectedArchive != null) {
+    inspectedArchive?.let { archive ->
         ArchiveDetailBottomSheet(
-            archive = inspectedArchive,
+            archive = archive,
             fallbackCostPerGbToman = workspace.costPerGbToman,
             fallbackAdminProfitPercent = workspace.adminProfitPercent,
-            isPrivateAdminBook = currentBook.isPrivateAdminBook,
+            isPrivateAdminBook = archive.ledgerOwnerUid == workspace.adminUid,
+            isAdmin = profile.isAdmin,
             onDismiss = { inspectedArchiveId = null },
-            onToggleItemPaid = { itemIndex, newPaid ->
-                viewModel.toggleArchiveItemPaidStatus(inspectedArchive, itemIndex, newPaid)
+            onToggleItemPaid = { itemId, newPaid ->
+                viewModel.toggleArchiveItemPaidStatus(archive, itemId, newPaid)
             },
-            onExportPdf = { archive ->
-                viewModel.exportArchiveToPdf(context, archive)
-            },
-            onDeleteArchive = { archive ->
-                viewModel.deleteArchiveSnapshot(archive)
-                inspectedArchiveId = null
-            }
+            onExportPdf = { viewModel.exportArchiveToPdf(context, it) },
+            onVoidArchive = { target, reason -> viewModel.voidArchiveSnapshot(target, reason) },
+            onSetSettled = { target, settled -> viewModel.setReportSettled(target, settled) }
         )
     }
 
@@ -578,7 +587,11 @@ fun MainLedgerScreen(
             exportReady = exportReady,
             onDismiss = viewModel::clearReadyPdfExport,
             onSaveToDevice = {
-                savePdfLauncher.launch(exportReady.file.name)
+                try {
+                    savePdfLauncher.launch(exportReady.file.name)
+                } catch (_: android.content.ActivityNotFoundException) {
+                    viewModel.reportActionError("No app on this device can choose a save location. Use Share PDF instead.")
+                }
             },
             onOpenPdf = {
                 val res = GraphicalPdfExporter.openPdfFile(context, exportReady.file)
@@ -587,7 +600,10 @@ fun MainLedgerScreen(
                 }
             },
             onSharePdf = {
-                GraphicalPdfExporter.sharePdfFile(context, exportReady.file, exportReady.title)
+                val res = GraphicalPdfExporter.sharePdfFile(context, exportReady.file, exportReady.title)
+                if (res.isFailure) {
+                    viewModel.reportActionError("Could not share the PDF. Create it again and retry.")
+                }
             }
         )
     }
@@ -603,6 +619,10 @@ private fun ActiveLedgerTabContent(
     onBookMenuExpandChange: (Boolean) -> Unit,
     onSelectBook: (String) -> Unit,
     isAdminInspectingSeller: Boolean,
+    isBookLoaded: Boolean,
+    isBusy: Boolean,
+    ledgerLoadError: String?,
+    onRetryLoad: () -> Unit,
     hasPendingSyncWrites: Boolean,
     metrics: LedgerSummaryMetrics,
     rawEntriesCount: Int,
@@ -610,9 +630,11 @@ private fun ActiveLedgerTabContent(
     searchQuery: String,
     onSearchQueryChange: (String) -> Unit,
     lastSentToAdminFormatted: String?,
+    isLegacyReport: Boolean,
     onSendListToAdmin: () -> Unit,
     onExportPdf: () -> Unit,
     onOpenResetDialog: () -> Unit,
+    canStartNewCycle: Boolean,
     onTogglePaid: (SaleEntry) -> Unit,
     onEditEntry: (SaleEntry) -> Unit,
     onDeleteEntry: (SaleEntry) -> Unit
@@ -622,13 +644,42 @@ private fun ActiveLedgerTabContent(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // 0. Pending Offline Sync Banner (OFF-06)
+        // REL-03: A failed load is an error, not an empty ledger.
+        if (ledgerLoadError != null) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Couldn't load these sales",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        Text(
+                            text = "$ledgerLoadError The totals below are not reliable until this loads.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        OutlinedButton(onClick = onRetryLoad) { Text("Try again") }
+                    }
+                }
+            }
+        }
+
+        // 0. Pending Offline Sync Banner (OFF-03)
         if (hasPendingSyncWrites) {
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.65f)
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer
                     ),
                     shape = RoundedCornerShape(14.dp)
                 ) {
@@ -641,12 +692,12 @@ private fun ActiveLedgerTabContent(
                     ) {
                         Icon(
                             imageVector = Icons.Default.CloudQueue,
-                            contentDescription = "Pending cloud sync",
+                            contentDescription = null,
                             tint = MaterialTheme.colorScheme.onTertiaryContainer,
                             modifier = Modifier.size(18.dp)
                         )
                         Text(
-                            text = "Saved locally — waiting to sync with cloud when online",
+                            text = "Saved on this phone. Waiting to sync when you're online.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onTertiaryContainer,
                             fontWeight = FontWeight.Medium
@@ -656,7 +707,7 @@ private fun ActiveLedgerTabContent(
             }
         }
 
-        // 1. Admin Book Switcher OR Seller "Send Current List to Admin" Action Bar
+        // 1. Admin Book Switcher OR Seller "Send to Admin" card
         item {
             if (profile.isAdmin && availableBooks.size > 1) {
                 Card(
@@ -666,33 +717,33 @@ private fun ActiveLedgerTabContent(
                     ),
                     shape = RoundedCornerShape(16.dp)
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Viewing",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = currentBook.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (isAdminInspectingSeller) {
                             Text(
-                                text = "VIEWING LEDGER BOOK",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.Bold
+                                text = when {
+                                    lastSentToAdminFormatted == null -> "No current report. The seller hasn't sent one since their last new cycle."
+                                    isLegacyReport -> "Older report (sent with a previous app version): $lastSentToAdminFormatted"
+                                    else -> "Latest report: $lastSentToAdminFormatted"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Text(
-                                text = currentBook.title,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
-                            )
-                            if (isAdminInspectingSeller) {
-                                Text(
-                                    text = lastSentToAdminFormatted?.let { "Last sent by Seller: $it" }
-                                        ?: "Waiting for Seller to press 'Send List'",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.secondary
-                                )
-                            }
                         }
                         Box {
                             OutlinedButton(
@@ -701,7 +752,7 @@ private fun ActiveLedgerTabContent(
                             ) {
                                 Icon(Icons.Default.Groups, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("Switch Book")
+                                Text("Switch book")
                             }
                             DropdownMenu(
                                 expanded = bookMenuExpanded,
@@ -713,7 +764,7 @@ private fun ActiveLedgerTabContent(
                                             Column {
                                                 Text(book.title, fontWeight = FontWeight.SemiBold)
                                                 Text(
-                                                    text = if (book.isPrivateAdminBook) "Admin Private Book" else "Seller Sent Snapshot",
+                                                    text = book.subtitle,
                                                     style = MaterialTheme.typography.bodySmall,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                                 )
@@ -730,7 +781,7 @@ private fun ActiveLedgerTabContent(
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer
                     ),
                     shape = RoundedCornerShape(16.dp)
                 ) {
@@ -740,22 +791,21 @@ private fun ActiveLedgerTabContent(
                             .padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Column(modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                text = "Send Current List to Admin",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = lastSentToAdminFormatted?.let { "Last sent to Admin: $it" }
-                                    ?: "Your active list is only sent to Admin when you press Send Current List",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
+                        Text(
+                            text = "Report to Admin",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                        Text(
+                            text = lastSentToAdminFormatted?.let { "Last report: $it. Changes you make now are not included until you send again." }
+                                ?: "The Admin only sees your sales when you send a report.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
                         Button(
                             onClick = onSendListToAdmin,
-                            enabled = rawEntriesCount > 0,
+                            enabled = rawEntriesCount > 0 && isBookLoaded && !isBusy,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .testTag("send_list_to_admin_button"),
@@ -763,51 +813,62 @@ private fun ActiveLedgerTabContent(
                         ) {
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.Send,
-                                contentDescription = "Send to Admin",
+                                contentDescription = null,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Send Current List to Admin")
+                            Text("Send report")
                         }
                     }
                 }
             }
         }
 
-        // 2. Vertical Stacked 3-Part Financial Split & Settlement Card (UI-01)
+        // 2. Financial summary (UI-01)
         item {
-            ThreePartFinancialSummaryCard(
+            LedgerSummaryCard(
                 metrics = metrics,
                 isPrivateAdminBook = currentBook.isPrivateAdminBook,
+                isSellerReport = isAdminInspectingSeller,
+                canExport = isBookLoaded && !isBusy,
                 onExportPdf = onExportPdf,
                 onOpenResetDialog = onOpenResetDialog,
-                canReset = !isAdminInspectingSeller && rawEntriesCount > 0
+                canReset = canStartNewCycle
             )
         }
 
-        // 3. Search Bar (UI-04: No paid/unpaid filter chips or aggregate paid/unpaid counts)
+        // 3. Search (UI-04: no paid/unpaid filter chips or aggregate paid/unpaid counts)
         item {
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = onSearchQueryChange,
-                placeholder = { Text("Search customer name, package, or note...") },
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search") },
-                trailingIcon = {
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { onSearchQueryChange("") }) {
-                            Icon(Icons.Default.Clear, contentDescription = "Clear search")
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = onSearchQueryChange,
+                    placeholder = { Text("Search name, plan or note") },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { onSearchQueryChange("") }) {
+                                Icon(Icons.Default.Clear, contentDescription = "Clear search")
+                            }
                         }
-                    }
-                },
-                singleLine = true,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("ledger_search_input"),
-                shape = RoundedCornerShape(14.dp)
-            )
+                    },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("ledger_search_input"),
+                    shape = RoundedCornerShape(14.dp)
+                )
+                if (searchQuery.isNotBlank()) {
+                    Text(
+                        text = "Showing ${filteredEntries.size} of $rawEntriesCount. Totals and PDF export include all $rawEntriesCount sales.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
         }
 
-        // 4. Customer Sales List
+        // 4. Sales list
         if (filteredEntries.isEmpty()) {
             item {
                 Card(
@@ -815,7 +876,7 @@ private fun ActiveLedgerTabContent(
                         .fillMaxWidth()
                         .padding(vertical = 18.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
                     ),
                     shape = RoundedCornerShape(18.dp)
                 ) {
@@ -826,12 +887,11 @@ private fun ActiveLedgerTabContent(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
-                            text = if (isAdminInspectingSeller) {
-                                "No List Sent by Seller Yet"
-                            } else if (rawEntriesCount == 0) {
-                                "No Active VPN Sales Recorded"
-                            } else {
-                                "No Matching Sales Found"
+                            text = when {
+                                !isBookLoaded && ledgerLoadError == null -> "Loading…"
+                                isAdminInspectingSeller -> "No current report from this seller"
+                                rawEntriesCount == 0 -> "No sales in this cycle yet"
+                                else -> "No matching sales"
                             },
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
@@ -839,9 +899,9 @@ private fun ActiveLedgerTabContent(
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
                             text = if (isAdminInspectingSeller) {
-                                "When this seller presses 'Send Current List to Admin', their sales and settlement breakdown will appear here."
+                                "When this seller sends a report, its sales and amounts appear here. Earlier reports are in Archives."
                             } else {
-                                "Tap 'Add VPN Sale' below to select a GB preset, toggle New User bonus GB, and record a sale."
+                                "Tap Add sale to record one."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -854,6 +914,7 @@ private fun ActiveLedgerTabContent(
                 SaleEntryRowCard(
                     entry = entry,
                     readOnly = isAdminInspectingSeller,
+                    canTogglePaid = !isAdminInspectingSeller || !isLegacyReport,
                     onTogglePaid = { onTogglePaid(entry) },
                     onEdit = { onEditEntry(entry) },
                     onDelete = { onDeleteEntry(entry) }
@@ -867,20 +928,17 @@ private fun ActiveLedgerTabContent(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ThreePartFinancialSummaryCard(
+private fun LedgerSummaryCard(
     metrics: LedgerSummaryMetrics,
     isPrivateAdminBook: Boolean,
+    isSellerReport: Boolean,
+    canExport: Boolean,
     onExportPdf: () -> Unit,
     onOpenResetDialog: () -> Unit,
     canReset: Boolean
 ) {
-    val settlementTitle = if (isPrivateAdminBook) {
-        "ADMIN INFRA + SHARE (PRIVATE BOOK)"
-    } else {
-        "AMOUNT SELLER PAYS ADMIN"
-    }
-
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -894,170 +952,35 @@ private fun ThreePartFinancialSummaryCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // 1. Gross Sales (plus sales count)
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Text(
-                    text = "GROSS SALES (${metrics.totalCustomers} SALES)",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = TomanFormatter.format(metrics.totalSalesToman),
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            // 2. Total Allocated Data
-            Surface(
-                color = MaterialTheme.colorScheme.secondaryContainer,
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp)
-                ) {
-                    Text(
-                        text = "TOTAL ALLOCATED DATA",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = TomanFormatter.formatGb(metrics.totalGb),
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                        fontWeight = FontWeight.Bold
-                    )
-                    val bonusLabel = if (metrics.totalBonusGb > 0.0) {
-                        "Includes +${TomanFormatter.formatGb(metrics.totalBonusGb)} New User bonus data"
-                    } else {
-                        "Total customer data allocated in this cycle"
-                    }
-                    Text(
-                        text = bonusLabel,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f)
-                    )
+            GrossSalesHeader(metrics)
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            FinancialBreakdownSection(
+                metrics = metrics,
+                isPrivateAdminBook = isPrivateAdminBook,
+                ratesNote = if (isSellerReport) {
+                    "Rates saved with this report: ${ratesLabel(metrics)}"
+                } else {
+                    "Current rates: ${ratesLabel(metrics)}. Change them in Settings."
                 }
-            }
-
-            // 3. Rate & Split Rule (Read-only display here; edited in Admin Settings only per UI-04)
-            Surface(
-                color = MaterialTheme.colorScheme.surface,
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp)
-                ) {
-                    Text(
-                        text = "RATE & PROFIT SPLIT RULE",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "Cost: ${TomanFormatter.format(metrics.costPerGbToman)}/GB  •  Split: Seller ${metrics.sellerProfitPercent}% / Admin ${metrics.adminProfitPercent}%",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
-
-            // 4. 1. Infrastructure Cost
-            StackedSummaryMetricCard(
-                title = "1. Infrastructure Cost",
-                amount = TomanFormatter.format(metrics.infraCostToman),
-                explanation = "${TomanFormatter.formatGb(metrics.totalGb)} × ${TomanFormatter.format(metrics.costPerGbToman)} per GB",
-                amountColor = MaterialTheme.colorScheme.onSurface
             )
 
-            // 5. Net Profit
-            StackedSummaryMetricCard(
-                title = "Net Profit (Remaining After Infra Cost)",
-                amount = TomanFormatter.format(metrics.netProfitToman),
-                explanation = "Gross Sales (${TomanFormatter.format(metrics.totalSalesToman)}) minus Infrastructure Cost (${TomanFormatter.format(metrics.infraCostToman)})",
-                amountColor = MaterialTheme.colorScheme.onSurface
-            )
-
-            // 6. 2. Seller Profit (50%)
-            StackedSummaryMetricCard(
-                title = "2. Seller Profit (${metrics.sellerProfitPercent}%)",
-                amount = TomanFormatter.format(metrics.sellerProfitToman),
-                explanation = if (isPrivateAdminBook) "Your Seller Share of Net Profit" else "Seller Net Profit Share",
-                amountColor = MaterialTheme.colorScheme.secondary
-            )
-
-            // 7. 3. Admin Profit (50%)
-            StackedSummaryMetricCard(
-                title = "3. Admin Profit (${metrics.adminProfitPercent}%)",
-                amount = TomanFormatter.format(metrics.adminProfitToman),
-                explanation = "Admin Net Profit Share",
-                amountColor = MaterialTheme.colorScheme.primary
-            )
-
-            // 8. Prominent Settlement Banner: Amount Seller Pays Admin (Admin Profit + Infra Cost)
-            Surface(
-                color = MaterialTheme.colorScheme.primaryContainer,
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("seller_payable_to_admin_banner")
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Text(
-                        text = settlementTitle,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = TomanFormatter.format(metrics.sellerPayableToAdminToman),
-                        style = MaterialTheme.typography.headlineSmall,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "Admin Profit (${TomanFormatter.format(metrics.adminProfitToman)}) + Infrastructure Cost (${TomanFormatter.format(metrics.infraCostToman)})",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.88f)
-                    )
-                }
-            }
-
-            // Action Buttons: Export PDF & Reset Ledger
-            Row(
+            // Buttons wrap onto a second line when the width or font scale needs it.
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
                     onClick = onExportPdf,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("summary_export_pdf_button"),
+                    enabled = canExport,
+                    modifier = Modifier.testTag("summary_export_pdf_button"),
                     shape = RoundedCornerShape(12.dp)
                 ) {
                     Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Export PDF Report")
+                    Text("Export PDF")
                 }
                 if (canReset) {
                     OutlinedButton(
@@ -1070,49 +993,10 @@ private fun ThreePartFinancialSummaryCard(
                     ) {
                         Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Reset")
+                        Text("Start new cycle")
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun StackedSummaryMetricCard(
-    title: String,
-    amount: String,
-    explanation: String,
-    amountColor: androidx.compose.ui.graphics.Color
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        color = MaterialTheme.colorScheme.surface,
-        shape = RoundedCornerShape(12.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = amount,
-                style = MaterialTheme.typography.titleMedium,
-                color = amountColor,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = explanation,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
     }
 }
@@ -1122,6 +1006,7 @@ private fun StackedSummaryMetricCard(
 private fun SaleEntryRowCard(
     entry: SaleEntry,
     readOnly: Boolean,
+    canTogglePaid: Boolean,
     onTogglePaid: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit
@@ -1158,13 +1043,18 @@ private fun SaleEntryRowCard(
             ) {
                 Checkbox(
                     checked = entry.isPaid,
-                    onCheckedChange = { if (!readOnly) onTogglePaid() },
-                    enabled = !readOnly,
+                    onCheckedChange = { if (canTogglePaid) onTogglePaid() },
+                    enabled = canTogglePaid,
                     colors = CheckboxDefaults.colors(
                         checkedColor = MaterialTheme.colorScheme.primary,
                         uncheckedColor = MaterialTheme.colorScheme.tertiary
                     ),
-                    modifier = Modifier.testTag("sale_paid_checkbox_${entry.id}")
+                    modifier = Modifier
+                        .semantics {
+                            contentDescription = "Customer paid: ${entry.customerName}"
+                            stateDescription = if (entry.isPaid) "Paid" else "Not paid yet"
+                        }
+                        .testTag("sale_paid_checkbox_${entry.id}")
                 )
             }
 
@@ -1188,14 +1078,9 @@ private fun SaleEntryRowCard(
                             color = MaterialTheme.colorScheme.secondaryContainer,
                             shape = RoundedCornerShape(6.dp)
                         ) {
-                            val bonusText = if (entry.bonusGb > 0.0) {
-                                "NEW USER (+${TomanFormatter.formatGb(entry.bonusGb)})"
-                            } else {
-                                "NEW USER"
-                            }
                             Text(
-                                text = bonusText,
-                                style = MaterialTheme.typography.labelSmall,
+                                text = "New user",
+                                style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSecondaryContainer,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
@@ -1205,21 +1090,20 @@ private fun SaleEntryRowCard(
                     if (entry.hasPendingSync) {
                         Icon(
                             imageVector = Icons.Default.CloudQueue,
-                            contentDescription = "Pending sync",
+                            contentDescription = "Waiting to sync",
                             tint = MaterialTheme.colorScheme.tertiary,
                             modifier = Modifier.size(16.dp)
                         )
                     }
                 }
 
-                val dataDetails = if (entry.isNewUser && entry.bonusGb > 0.0) {
-                    "${TomanFormatter.formatGbNumberOnly(entry.dataGb)} GB total (${TomanFormatter.formatGbNumberOnly(entry.baseDataGb)} + ${TomanFormatter.formatGbNumberOnly(entry.bonusGb)} bonus)"
-                } else {
-                    TomanFormatter.formatGb(entry.dataGb)
-                }
-
                 Text(
-                    text = "$dataDetails • ${entry.presetName.ifBlank { "Custom Plan" }}",
+                    text = TomanFormatter.formatAllocationSummary(entry.safeDataGb, entry.safeBonusGb, entry.isNewUser),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = entry.presetName.ifBlank { "Custom plan" },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1235,38 +1119,35 @@ private fun SaleEntryRowCard(
                 Text(
                     text = TomanFormatter.format(entry.priceToman),
                     style = MaterialTheme.typography.titleSmall,
-                    color = if (entry.isPaid) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.tertiary
-                    },
+                    color = MaterialTheme.colorScheme.onSurface,
                     fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = if (entry.isPaid) "Paid" else "Not paid yet",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (entry.isPaid) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary
                 )
             }
 
             if (!readOnly) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     IconButton(
                         onClick = onEdit,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("edit_sale_button_${entry.id}")
+                        modifier = Modifier.testTag("edit_sale_button_${entry.id}")
                     ) {
                         Icon(
                             imageVector = Icons.Default.Edit,
-                            contentDescription = "Edit Sale",
+                            contentDescription = "Edit sale for ${entry.customerName}",
                             modifier = Modifier.size(20.dp)
                         )
                     }
                     IconButton(
                         onClick = onDelete,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("delete_sale_button_${entry.id}")
+                        modifier = Modifier.testTag("delete_sale_button_${entry.id}")
                     ) {
                         Icon(
                             imageVector = Icons.Default.DeleteOutline,
-                            contentDescription = "Delete Sale",
+                            contentDescription = "Delete sale for ${entry.customerName}",
                             tint = MaterialTheme.colorScheme.error,
                             modifier = Modifier.size(20.dp)
                         )
@@ -1281,25 +1162,21 @@ private fun SaleEntryRowCard(
 private fun ArchivesTabContent(
     modifier: Modifier,
     archives: List<LedgerArchive>,
+    reports: List<LedgerArchive>,
+    archiveLoadError: String?,
     workspace: WorkspaceConfig,
     currentBook: LedgerTargetBook,
+    isAdmin: Boolean,
+    isBusy: Boolean,
     onInspectArchive: (LedgerArchive) -> Unit,
-    onExportArchivePdf: (LedgerArchive) -> Unit,
-    onDeleteArchive: (LedgerArchive) -> Unit
+    onExportArchivePdf: (LedgerArchive) -> Unit
 ) {
-    val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy • HH:mm", Locale.US) }
-    val settlementLabel = if (currentBook.isPrivateAdminBook) {
-        "Admin Infra + Share"
-    } else {
-        "Amount Seller Pays Admin"
-    }
-
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // UI-02: Clean Header + Owner Subtitle
+        // UI-02: Short title, owner as a subtitle, one-line helper.
         item {
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
@@ -1308,17 +1185,37 @@ private fun ArchivesTabContent(
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Book: ${currentBook.title}",
+                    text = currentBook.title,
                     style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
+                    color = MaterialTheme.colorScheme.primary
                 )
                 Text(
-                    text = "Tap any archive to inspect sales, toggle Paid/Unpaid checkboxes, or export a PDF report.",
+                    text = "Open an archive to view sales or export a PDF.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+        }
+
+        if (archiveLoadError != null) {
+            item { InlineWarning("Couldn't load archives. $archiveLoadError") }
+        }
+
+        if (reports.isNotEmpty()) {
+            item {
+                SectionHeading(if (isAdmin) "Reports sent by this seller" else "Reports you sent")
+            }
+            items(reports, key = { "report_${it.id}" }) { report ->
+                SnapshotSummaryCard(
+                    snapshot = report,
+                    workspace = workspace,
+                    isPrivateAdminBook = false,
+                    isBusy = isBusy,
+                    onOpen = { onInspectArchive(report) },
+                    onExportPdf = { onExportArchivePdf(report) }
+                )
+            }
+            item { SectionHeading("Closed cycles") }
         }
 
         if (archives.isEmpty()) {
@@ -1326,9 +1223,9 @@ private fun ArchivesTabContent(
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 20.dp),
+                        .padding(vertical = 12.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
                     ),
                     shape = RoundedCornerShape(18.dp)
                 ) {
@@ -1346,12 +1243,12 @@ private fun ArchivesTabContent(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "No Archived Cycles Yet",
+                            text = "No closed cycles yet",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "When you reset the active ledger and choose 'Save snapshot to Archives', past cycles are stored here.",
+                            text = "When you start a new cycle and keep an archive, the closed cycle appears here.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1360,128 +1257,154 @@ private fun ArchivesTabContent(
             }
         } else {
             items(archives, key = { it.id }) { archive ->
-                val archiveMetrics = archive.computeMetrics(
-                    fallbackCostPerGb = workspace.costPerGbToman,
-                    fallbackAdminPercent = workspace.adminProfitPercent
+                SnapshotSummaryCard(
+                    snapshot = archive,
+                    workspace = workspace,
+                    isPrivateAdminBook = currentBook.isPrivateAdminBook,
+                    isBusy = isBusy,
+                    onOpen = { onInspectArchive(archive) },
+                    onExportPdf = { onExportArchivePdf(archive) }
                 )
-                val dateLabel = archive.createdAt?.toDate()?.let { dateFormat.format(it) } ?: "Archived"
-                val cleanOwner = TomanFormatter.sanitizeOwnerDisplayName(archive.ownerName)
+            }
+        }
+    }
+}
 
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onInspectArchive(archive) }
-                        .testTag("archive_card_${archive.id}"),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    ),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.Top
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = archive.cycleTitle,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "$cleanOwner • $dateLabel",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Row {
-                                IconButton(
-                                    onClick = { onExportArchivePdf(archive) },
-                                    modifier = Modifier.minimumInteractiveComponentSize()
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.PictureAsPdf,
-                                        contentDescription = "Export Archive PDF",
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
-                                }
-                                IconButton(
-                                    onClick = { onDeleteArchive(archive) },
-                                    modifier = Modifier.minimumInteractiveComponentSize()
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.DeleteOutline,
-                                        contentDescription = "Delete Archive",
-                                        tint = MaterialTheme.colorScheme.error
-                                    )
-                                }
-                            }
-                        }
+/** UI-02: One archive or sent report. Title, owner and date each get their own line; actions sit below. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SnapshotSummaryCard(
+    snapshot: LedgerArchive,
+    workspace: WorkspaceConfig,
+    isPrivateAdminBook: Boolean,
+    isBusy: Boolean,
+    onOpen: () -> Unit,
+    onExportPdf: () -> Unit
+) {
+    val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy 'at' HH:mm", Locale.US) }
+    val metrics = remember(snapshot, workspace.costPerGbToman, workspace.adminProfitPercent) {
+        snapshot.computeMetrics(
+            fallbackCostPerGb = workspace.costPerGbToman,
+            fallbackAdminPercent = workspace.adminProfitPercent
+        )
+    }
+    val dateText = snapshot.createdAt?.toDate()?.let { dateFormat.format(it) }
+    val title = when {
+        snapshot.isLegacyReport -> "Older report"
+        snapshot.isSubmission -> "Report"
+        else -> snapshot.cycleTitle
+    }
 
-                        // UI-02: Vertical stacked metric summary inside each Archive Card (no side-by-side Toman squeezing)
-                        Surface(
-                            color = MaterialTheme.colorScheme.surface,
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Text(
-                                    text = "Gross Sales: ${TomanFormatter.format(archive.totalSalesToman)}",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                Text(
-                                    text = "${archiveMetrics.totalCustomers} sales • ${TomanFormatter.formatGb(archive.totalGb)} allocated",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.secondary,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Text(
-                                    text = "Seller Profit (${archiveMetrics.sellerProfitPercent}%): ${TomanFormatter.format(archiveMetrics.sellerProfitToman)}  •  Admin Profit (${archiveMetrics.adminProfitPercent}%): ${TomanFormatter.format(archiveMetrics.adminProfitToman)}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onOpen() }
+            .testTag("archive_card_${snapshot.id}"),
+        colors = CardDefaults.cardColors(
+            containerColor = if (snapshot.isVoided) {
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
+            }
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = TomanFormatter.sanitizeOwnerDisplayName(snapshot.ownerName),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = when {
+                        snapshot.hasPendingSync -> "Saved on this phone, waiting to upload"
+                        dateText == null -> "Date not available"
+                        snapshot.isSubmission || snapshot.isLegacyReport -> "Uploaded $dateText"
+                        else -> "Closed $dateText"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                StatusBadges(snapshot)
+            }
 
-                        Surface(
-                            color = MaterialTheme.colorScheme.primaryContainer,
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
-                            ) {
-                                Text(
-                                    text = "$settlementLabel: ${TomanFormatter.format(archiveMetrics.sellerPayableToAdminToman)}",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "Infra Cost: ${TomanFormatter.format(archiveMetrics.infraCostToman)} (${TomanFormatter.format(archiveMetrics.costPerGbToman)}/GB)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
-                                )
-                            }
-                        }
-                    }
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = "Gross sales",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = TomanFormatter.format(metrics.totalSalesToman),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+                MetadataLine(listOf(salesCountLabel(metrics.salesCount), TomanFormatter.formatGb(metrics.totalGb)))
+            }
+
+            if (isPrivateAdminBook) {
+                MetricBlock(
+                    label = "Business profit",
+                    amount = TomanFormatter.format(metrics.netProfitToman),
+                    amountColor = MaterialTheme.colorScheme.primary
+                )
+            } else {
+                MetricBlock(
+                    label = "Amount due to Admin",
+                    amount = TomanFormatter.format(metrics.sellerPayableToAdminToman),
+                    amountColor = MaterialTheme.colorScheme.primary
+                )
+                MetricBlock(
+                    label = "Seller profit (${metrics.sellerProfitPercent}%)",
+                    amount = TomanFormatter.format(metrics.sellerProfitToman),
+                    amountColor = MaterialTheme.colorScheme.secondary
+                )
+            }
+
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onOpen) { Text("Open") }
+                TextButton(onClick = onExportPdf, enabled = !isBusy) {
+                    Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Export PDF")
                 }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun StatusBadges(snapshot: LedgerArchive) {
+    val badges = buildList {
+        if (snapshot.isVoided) add("Voided")
+        if (snapshot.isSettled) add("Settled")
+        if (snapshot.isLegacyReport) add("Read-only")
+    }
+    if (badges.isEmpty()) return
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 4.dp)) {
+        badges.forEach { label ->
+            Surface(
+                color = if (label == "Voided") MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer,
+                shape = RoundedCornerShape(6.dp)
+            ) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (label == "Voided") MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                )
             }
         }
     }
@@ -1550,12 +1473,12 @@ private fun AdminSettingsAndSplitTabContent(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "Global GB Cost & Profit Split",
+                        text = "Cost per GB and profit split",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Configure the VPS/infrastructure cost per GB and the default 50/50 profit split between Admin and Sellers.",
+                        text = "Applies to active sales right away. Sent reports and archives keep the rates they were saved with.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1566,7 +1489,7 @@ private fun AdminSettingsAndSplitTabContent(
                             costPerGbInput = InputValidator.normalizeDigits(it).filter { ch -> ch.isDigit() }
                             rateValidationError = null
                         },
-                        label = { Text("Infrastructure Cost per 1 GB (Toman)") },
+                        label = { Text("Infrastructure cost per GB") },
                         suffix = { Text("Toman") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
@@ -1586,7 +1509,7 @@ private fun AdminSettingsAndSplitTabContent(
                                 adminPercentInput = InputValidator.normalizeDigits(it).filter { ch -> ch.isDigit() }.take(3)
                                 rateValidationError = null
                             },
-                            label = { Text("Admin Profit %") },
+                            label = { Text("Admin share %") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             singleLine = true,
                             modifier = Modifier
@@ -1600,7 +1523,7 @@ private fun AdminSettingsAndSplitTabContent(
                         ) {
                             Column(modifier = Modifier.padding(12.dp)) {
                                 Text(
-                                    text = "Seller Profit Share",
+                                    text = "Seller share",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
@@ -1642,7 +1565,7 @@ private fun AdminSettingsAndSplitTabContent(
                     ) {
                         Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Save Global Cost & Split")
+                        Text("Save rates")
                     }
                 }
             }
@@ -1669,7 +1592,7 @@ private fun AdminSettingsAndSplitTabContent(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Package Presets & New User Bonus GB",
+                            text = "Plans",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
                         )
@@ -1684,12 +1607,12 @@ private fun AdminSettingsAndSplitTabContent(
                                     presetValidationError = null
                                 }
                             ) {
-                                Text("+ New Preset")
+                                Text("New plan")
                             }
                         }
                     }
                     Text(
-                        text = "Tap any preset below to edit its standard GB, Toman price, or the extra bonus GB given to a New User on their first purchase.",
+                        text = "Tap a plan to edit its GB, price, or the bonus GB a new user gets. Removing a change to a built-in plan restores its default.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1723,11 +1646,11 @@ private fun AdminSettingsAndSplitTabContent(
                                     {
                                         IconButton(
                                             onClick = { onDeleteCustomPreset(preset) },
-                                            modifier = Modifier.size(20.dp)
+                                            modifier = Modifier.size(32.dp)
                                         ) {
                                             Icon(
                                                 imageVector = Icons.Default.Clear,
-                                                contentDescription = "Delete preset",
+                                                contentDescription = if (preset.id.startsWith("builtin_")) "Restore default for ${preset.label}" else "Remove plan ${preset.label}",
                                                 modifier = Modifier.size(14.dp)
                                             )
                                         }
@@ -1747,7 +1670,7 @@ private fun AdminSettingsAndSplitTabContent(
                             presetLabelInput = it
                             presetValidationError = null
                         },
-                        label = { Text("Preset Label (e.g., 20 GB Standard)") },
+                        label = { Text("Plan name (e.g., 20 GB Standard)") },
                         singleLine = true,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1764,7 +1687,7 @@ private fun AdminSettingsAndSplitTabContent(
                                 presetGbInput = InputValidator.normalizeDigits(it).filter { ch -> ch.isDigit() || ch == '.' }
                                 presetValidationError = null
                             },
-                            label = { Text("Standard GB") },
+                            label = { Text("Plan GB") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                             singleLine = true,
                             modifier = Modifier
@@ -1777,7 +1700,7 @@ private fun AdminSettingsAndSplitTabContent(
                                 presetBonusGbInput = InputValidator.normalizeDigits(it).filter { ch -> ch.isDigit() || ch == '.' }
                                 presetValidationError = null
                             },
-                            label = { Text("New User +GB") },
+                            label = { Text("New-user bonus GB") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                             singleLine = true,
                             modifier = Modifier
@@ -1792,7 +1715,7 @@ private fun AdminSettingsAndSplitTabContent(
                             presetPriceInput = InputValidator.normalizeDigits(it).filter { ch -> ch.isDigit() }
                             presetValidationError = null
                         },
-                        label = { Text("Preset Price (Toman)") },
+                        label = { Text("Plan price") },
                         suffix = { Text("Toman") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
@@ -1811,11 +1734,11 @@ private fun AdminSettingsAndSplitTabContent(
 
                     Button(
                         onClick = {
-                            val gbRes = InputValidator.validateDataGb(presetGbInput, "Standard GB")
+                            val gbRes = InputValidator.validateDataGb(presetGbInput, "Plan GB")
                             val bonusRes = InputValidator.validateBonusGb(presetBonusGbInput)
-                            val priceRes = InputValidator.validatePriceToman(presetPriceInput, "Preset Price")
+                            val priceRes = InputValidator.validatePriceToman(presetPriceInput, "Plan price")
                             when {
-                                presetLabelInput.isBlank() -> presetValidationError = "Please enter a preset label."
+                                presetLabelInput.isBlank() -> presetValidationError = "Please enter a plan name."
                                 gbRes.isFailure -> presetValidationError = gbRes.exceptionOrNull()?.message
                                 bonusRes.isFailure -> presetValidationError = bonusRes.exceptionOrNull()?.message
                                 priceRes.isFailure -> presetValidationError = priceRes.exceptionOrNull()?.message
@@ -1843,7 +1766,7 @@ private fun AdminSettingsAndSplitTabContent(
                     ) {
                         Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text(if (editingPresetId != null) "Update Selected Preset" else "Save New Preset")
+                        Text(if (editingPresetId != null) "Update plan" else "Add plan")
                     }
                 }
             }
@@ -1865,21 +1788,21 @@ private fun AdminSettingsAndSplitTabContent(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
-                        text = "Approve Seller Google Account",
+                        text = "Approve a seller",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     OutlinedTextField(
                         value = newSellerName,
                         onValueChange = { newSellerName = it },
-                        label = { Text("Seller Display Name") },
+                        label = { Text("Seller name") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = newSellerEmail,
                         onValueChange = { newSellerEmail = it },
-                        label = { Text("Seller Google Email Address") },
+                        label = { Text("Seller's Google email") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -1894,7 +1817,7 @@ private fun AdminSettingsAndSplitTabContent(
                     ) {
                         Icon(Icons.Default.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Approve Seller Email")
+                        Text("Approve email")
                     }
                 }
             }
@@ -1904,7 +1827,7 @@ private fun AdminSettingsAndSplitTabContent(
         if (workspaceUsers.isNotEmpty()) {
             item {
                 Text(
-                    text = "Registered Workspace Accounts (${workspaceUsers.size})",
+                    text = "Accounts (${workspaceUsers.size})",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
                 )
@@ -1925,7 +1848,12 @@ private fun AdminSettingsAndSplitTabContent(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(userItem.displayName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                             Text(
-                                text = "${userItem.role} • ${userItem.status}",
+                                text = when {
+                                    userItem.role == "ADMIN" -> "Admin"
+                                    userItem.status == "APPROVED" -> "Seller • approved"
+                                    userItem.status == "REVOKED" -> "Seller • access revoked"
+                                    else -> "Seller • waiting for approval"
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1947,7 +1875,7 @@ private fun AdminSettingsAndSplitTabContent(
         if (approvedEmails.isNotEmpty()) {
             item {
                 Text(
-                    text = "Pre-Approved Seller Emails (${approvedEmails.size})",
+                    text = "Invitations (${approvedEmails.size})",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
                 )
@@ -1968,12 +1896,14 @@ private fun AdminSettingsAndSplitTabContent(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(item.sellerName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                             Text(item.email, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (item.status == "REVOKED") {
+                                Text("Revoked", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.error)
+                            }
                         }
-                        IconButton(onClick = { onRemovePreApprovedEmail(item) }) {
-                            Icon(
-                                imageVector = Icons.Default.DeleteOutline,
-                                contentDescription = "Remove Approved Email",
-                                tint = MaterialTheme.colorScheme.error
+                        TextButton(onClick = { onRemovePreApprovedEmail(item) }) {
+                            Text(
+                                text = "Cancel invitation",
+                                color = MaterialTheme.colorScheme.error
                             )
                         }
                     }
