@@ -1,0 +1,27 @@
+*.iml
+.gradle
+.kotlin
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+.env
+*-debug.log
+
+# Secrets / local config
+app/google-services.json
+app/src/main/res/values/firebase_applet_config.xml
+*.jks
+*.keystore
+*.log
+.env
+.aistudio/

@@ -1,0 +1,460 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Reusable Hardened Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isFiniteNumber(n) {
+      return (n is int || n is float) && n == n;
+    }
+
+    function isWorkspaceAdmin() {
+      return isSignedIn() &&
+             exists(/databases/$(database)/documents/config/workspace) &&
+             get(/databases/$(database)/documents/config/workspace).data.adminUid == request.auth.uid;
+    }
+
+    // SEC-01: Require an existing, explicitly APPROVED UserProfile in the active workspace
+    function isApprovedMember() {
+      return isSignedIn() &&
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'APPROVED' &&
+             exists(/databases/$(database)/documents/config/workspace) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.workspaceAdminUid ==
+               get(/databases/$(database)/documents/config/workspace).data.adminUid;
+    }
+
+    function matchesTokenEmailIfPresent(emailField) {
+      return !('email' in request.auth.token) ||
+             request.auth.token.email == null ||
+             emailField == request.auth.token.email.lower();
+    }
+
+    function isValidArchiveItemMap(item) {
+      return item is map &&
+             item.keys().hasAll(['customerName', 'dataGb', 'priceToman', 'isPaid']) &&
+             item.customerName is string && item.customerName.size() >= 1 && item.customerName.size() <= 100 &&
+             isFiniteNumber(item.dataGb) && item.dataGb > 0 && item.dataGb <= 100000 &&
+             item.priceToman is int && item.priceToman >= 0 && item.priceToman <= 10000000000 &&
+             item.isPaid is bool &&
+             (!('bonusGb' in item) || (isFiniteNumber(item.bonusGb) && item.bonusGb >= 0 && item.bonusGb <= item.dataGb));
+    }
+
+    // --- Validation Blueprints (Pillar 2) ---
+
+    function isValidWorkspaceConfig(data) {
+      return data.keys().hasAll(['adminUid', 'adminEmail', 'businessName', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly([
+               'adminUid', 'adminEmail', 'businessName',
+               'costPerGbToman', 'adminProfitPercent', 'settingsRevision',
+               'createdAt', 'updatedAt'
+             ]) &&
+             isValidId(data.adminUid) &&
+             data.adminEmail is string && data.adminEmail.size() >= 0 && data.adminEmail.size() <= 200 &&
+             data.businessName is string && data.businessName.size() >= 1 && data.businessName.size() <= 100 &&
+             (!('costPerGbToman' in data) || (data.costPerGbToman is int && data.costPerGbToman >= 0 && data.costPerGbToman <= 1000000000)) &&
+             (!('adminProfitPercent' in data) || (data.adminProfitPercent is int && data.adminProfitPercent >= 0 && data.adminProfitPercent <= 100)) &&
+             (!('settingsRevision' in data) || (data.settingsRevision is int && data.settingsRevision >= 1)) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['userId', 'workspaceAdminUid', 'email', 'emailKey', 'displayName', 'role', 'status', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['userId', 'workspaceAdminUid', 'email', 'emailKey', 'displayName', 'role', 'status', 'createdAt', 'updatedAt']) &&
+             data.userId is string && data.userId == userId && isValidId(data.userId) &&
+             isValidId(data.workspaceAdminUid) &&
+             data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+             isValidId(data.emailKey) &&
+             data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+             data.role is string && (data.role == 'ADMIN' || data.role == 'SELLER') &&
+             data.status is string && (data.status == 'APPROVED' || data.status == 'PENDING' || data.status == 'REVOKED') &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidApprovedEmail(data, emailKey) {
+      return data.keys().hasAll(['emailKey', 'email', 'sellerName', 'workspaceAdminUid', 'status', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['emailKey', 'email', 'sellerName', 'workspaceAdminUid', 'status', 'createdAt', 'updatedAt']) &&
+             data.emailKey is string && data.emailKey == emailKey && isValidId(data.emailKey) &&
+             data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+             data.sellerName is string && data.sellerName.size() >= 1 && data.sellerName.size() <= 100 &&
+             isValidId(data.workspaceAdminUid) &&
+             data.status is string && (data.status == 'APPROVED' || data.status == 'REVOKED') &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidSaleEntry(data, ownerUid) {
+      return data.keys().hasAll([
+               'ledgerOwnerUid', 'workspaceAdminUid', 'customerName', 'dataGb',
+               'priceToman', 'originalPresetPriceToman', 'presetName', 'isPaid',
+               'note', 'createdAt', 'updatedAt'
+             ]) &&
+             data.keys().hasOnly([
+               'ledgerOwnerUid', 'workspaceAdminUid', 'customerName', 'dataGb',
+               'priceToman', 'originalPresetPriceToman', 'presetName', 'isPaid',
+               'isNewUser', 'bonusGb',
+               'note', 'createdAt', 'updatedAt'
+             ]) &&
+             data.ledgerOwnerUid is string && data.ledgerOwnerUid == ownerUid && isValidId(data.ledgerOwnerUid) &&
+             isValidId(data.workspaceAdminUid) &&
+             data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 100 &&
+             isFiniteNumber(data.dataGb) && data.dataGb > 0 && data.dataGb <= 100000 &&
+             data.priceToman is int && data.priceToman >= 0 && data.priceToman <= 10000000000 &&
+             data.originalPresetPriceToman is int && data.originalPresetPriceToman >= 0 && data.originalPresetPriceToman <= 10000000000 &&
+             data.presetName is string && data.presetName.size() <= 80 &&
+             data.isPaid is bool &&
+             (!('isNewUser' in data) || data.isNewUser is bool) &&
+             (!('bonusGb' in data) || (isFiniteNumber(data.bonusGb) && data.bonusGb >= 0 && data.bonusGb <= data.dataGb)) &&
+             data.note is string && data.note.size() <= 300 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidLedgerArchive(data, ownerUid) {
+      return data.keys().hasAll([
+               'ledgerOwnerUid', 'workspaceAdminUid', 'ownerName', 'cycleTitle',
+               'totalSalesToman', 'paidToman', 'unpaidToman', 'totalGb',
+               'entryCount', 'items', 'createdAt'
+             ]) &&
+             data.keys().hasOnly([
+               'ledgerOwnerUid', 'workspaceAdminUid', 'ownerName', 'cycleTitle',
+               'totalSalesToman', 'paidToman', 'unpaidToman', 'totalGb',
+               'costPerGbToman', 'adminProfitPercent', 'settingsRevision',
+               'paidMap', 'submissionRevision', 'supersededByReset', 'updatedAt',
+               'entryCount', 'items', 'createdAt'
+             ]) &&
+             data.ledgerOwnerUid is string && data.ledgerOwnerUid == ownerUid && isValidId(data.ledgerOwnerUid) &&
+             isValidId(data.workspaceAdminUid) &&
+             data.ownerName is string && data.ownerName.size() >= 1 && data.ownerName.size() <= 100 &&
+             data.cycleTitle is string && data.cycleTitle.size() >= 1 && data.cycleTitle.size() <= 120 &&
+             data.totalSalesToman is int && data.totalSalesToman >= 0 && data.totalSalesToman <= 100000000000 &&
+             data.paidToman is int && data.paidToman >= 0 && data.paidToman <= 100000000000 &&
+             data.unpaidToman is int && data.unpaidToman >= 0 && data.unpaidToman <= 100000000000 &&
+             data.totalSalesToman == data.paidToman + data.unpaidToman &&
+             isFiniteNumber(data.totalGb) && data.totalGb >= 0 && data.totalGb <= 10000000 &&
+             (!('costPerGbToman' in data) || (data.costPerGbToman is int && data.costPerGbToman >= 0 && data.costPerGbToman <= 1000000000)) &&
+             (!('adminProfitPercent' in data) || (data.adminProfitPercent is int && data.adminProfitPercent >= 0 && data.adminProfitPercent <= 100)) &&
+             (!('settingsRevision' in data) || (data.settingsRevision is int && data.settingsRevision >= 1)) &&
+             (!('paidMap' in data) || data.paidMap is map) &&
+             (!('submissionRevision' in data) || (data.submissionRevision is int && data.submissionRevision >= 1)) &&
+             (!('supersededByReset' in data) || data.supersededByReset is bool) &&
+             (!('updatedAt' in data) || (data.updatedAt is timestamp && data.updatedAt <= request.time)) &&
+             data.entryCount is int && data.entryCount >= 0 && data.entryCount <= 500 &&
+             data.items is list && data.items.size() == data.entryCount && data.items.size() <= 500 &&
+             (data.items.size() == 0 || (
+               isValidArchiveItemMap(data.items[0]) &&
+               isValidArchiveItemMap(data.items[data.items.size() - 1])
+             )) &&
+             data.createdAt is timestamp && data.createdAt <= request.time;
+    }
+
+    function isValidDataPreset(data, ownerUid) {
+      return data.keys().hasAll([
+               'ledgerOwnerUid', 'workspaceAdminUid', 'label', 'dataGb',
+               'defaultPriceToman', 'createdAt', 'updatedAt'
+             ]) &&
+             data.keys().hasOnly([
+               'ledgerOwnerUid', 'workspaceAdminUid', 'label', 'dataGb',
+               'defaultPriceToman', 'newUserBonusGb', 'createdAt', 'updatedAt'
+             ]) &&
+             data.ledgerOwnerUid is string && data.ledgerOwnerUid == ownerUid && isValidId(data.ledgerOwnerUid) &&
+             isValidId(data.workspaceAdminUid) &&
+             data.label is string && data.label.size() >= 1 && data.label.size() <= 80 &&
+             isFiniteNumber(data.dataGb) && data.dataGb > 0 && data.dataGb <= 100000 &&
+             data.defaultPriceToman is int && data.defaultPriceToman >= 0 && data.defaultPriceToman <= 10000000000 &&
+             (!('newUserBonusGb' in data) || (isFiniteNumber(data.newUserBonusGb) && data.newUserBonusGb >= 0 && data.newUserBonusGb <= 100000)) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    // --- 1. Singleton Workspace Configuration ---
+    match /config/{configId} {
+      allow get: if isSignedIn() && configId == 'workspace';
+      allow list: if false;
+
+      allow create: if isSignedIn() &&
+                       configId == 'workspace' &&
+                       isValidWorkspaceConfig(incoming()) &&
+                       incoming().adminUid == request.auth.uid &&
+                       !exists(/databases/$(database)/documents/config/workspace);
+
+      allow update: if isSignedIn() &&
+                       configId == 'workspace' &&
+                       isValidWorkspaceConfig(incoming()) &&
+                       existing().adminUid == request.auth.uid &&
+                       incoming().adminUid == existing().adminUid &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'businessName', 'adminEmail', 'costPerGbToman', 'adminProfitPercent', 'settingsRevision', 'updatedAt'
+                       ]);
+
+      allow delete: if false;
+    }
+
+    // --- 2. User Profiles & Role Assignments ---
+    match /users/{userId} {
+      allow get: if isSignedIn() &&
+                    isValidId(userId) &&
+                    (request.auth.uid == userId ||
+                     (resource != null && existing().workspaceAdminUid == request.auth.uid) ||
+                     isWorkspaceAdmin());
+
+      allow list: if isSignedIn() &&
+                     (resource.data.userId == request.auth.uid ||
+                      (isWorkspaceAdmin() && resource.data.workspaceAdminUid == request.auth.uid));
+
+      allow create: if isSignedIn() &&
+                       isValidId(userId) &&
+                       isValidUserProfile(incoming(), userId) &&
+                       exists(/databases/$(database)/documents/config/workspace) &&
+                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid &&
+                       (
+                         // Case A: Workspace Admin creating own ADMIN profile or a Seller profile
+                         (isWorkspaceAdmin() && (
+                           (request.auth.uid == userId && incoming().role == 'ADMIN' && incoming().status == 'APPROVED') ||
+                           (incoming().role == 'SELLER')
+                         )) ||
+                         // Case B: Seller registering own PENDING profile (bound to verified token email if present)
+                         (request.auth.uid == userId &&
+                          incoming().role == 'SELLER' &&
+                          incoming().status == 'PENDING' &&
+                          matchesTokenEmailIfPresent(incoming().email)) ||
+                         // Case C: Seller registering own APPROVED profile backed by pre-approved email record
+                         (request.auth.uid == userId &&
+                          incoming().role == 'SELLER' &&
+                          incoming().status == 'APPROVED' &&
+                          matchesTokenEmailIfPresent(incoming().email) &&
+                          exists(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)) &&
+                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.email == incoming().email &&
+                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.workspaceAdminUid == incoming().workspaceAdminUid &&
+                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.status == 'APPROVED')
+                       );
+
+      allow update: if isSignedIn() &&
+                       isValidId(userId) &&
+                       isValidUserProfile(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().workspaceAdminUid == existing().workspaceAdminUid &&
+                       incoming().email == existing().email &&
+                       incoming().emailKey == existing().emailKey &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         // Action 1: Admin updates seller approval status or display name
+                         (isWorkspaceAdmin() &&
+                          incoming().role == existing().role &&
+                          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'displayName', 'updatedAt'])) ||
+                         // Action 2: Owner updates own display name without changing role/status
+                         (request.auth.uid == userId &&
+                          incoming().role == existing().role &&
+                          incoming().status == existing().status &&
+                          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])) ||
+                         // Action 3: Seller upgrades strictly from PENDING to APPROVED via approved_emails proof (SEC-03: REVOKED cannot self-reverse)
+                         (request.auth.uid == userId &&
+                          existing().role == 'SELLER' &&
+                          existing().status == 'PENDING' &&
+                          incoming().role == 'SELLER' &&
+                          incoming().status == 'APPROVED' &&
+                          matchesTokenEmailIfPresent(incoming().email) &&
+                          exists(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)) &&
+                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.email == incoming().email &&
+                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.workspaceAdminUid == incoming().workspaceAdminUid &&
+                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.status == 'APPROVED' &&
+                          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'displayName', 'updatedAt']))
+                       );
+
+      allow delete: if isSignedIn() && isValidId(userId) && isWorkspaceAdmin();
+    }
+
+    // --- 3. Admin-Approved Seller Emails (SEC-02: Scoped to Admin or matching claimant email) ---
+    match /approved_emails/{emailKey} {
+      allow get: if isSignedIn() &&
+                    isValidId(emailKey) &&
+                    (isWorkspaceAdmin() ||
+                     resource == null ||
+                     matchesTokenEmailIfPresent(resource.data.email));
+
+      allow list: if isSignedIn() &&
+                     isWorkspaceAdmin() &&
+                     resource.data.workspaceAdminUid == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(emailKey) &&
+                       isValidApprovedEmail(incoming(), emailKey) &&
+                       isWorkspaceAdmin() &&
+                       exists(/databases/$(database)/documents/config/workspace) &&
+                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid;
+
+      allow update: if isSignedIn() &&
+                       isValidId(emailKey) &&
+                       isValidApprovedEmail(incoming(), emailKey) &&
+                       isWorkspaceAdmin() &&
+                       incoming().emailKey == existing().emailKey &&
+                       incoming().email == existing().email &&
+                       incoming().workspaceAdminUid == existing().workspaceAdminUid &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['sellerName', 'status', 'updatedAt']);
+
+      allow delete: if isSignedIn() && isValidId(emailKey) && isWorkspaceAdmin();
+    }
+
+    // --- 4. Active Ledger Entries (SEC-01: Strictly Approved Members or Workspace Admin) ---
+    match /ledgers/{ownerUid}/entries/{entryId} {
+      allow get: if isSignedIn() &&
+                    isValidId(ownerUid) &&
+                    isValidId(entryId) &&
+                    (
+                      (request.auth.uid == ownerUid && isApprovedMember()) ||
+                      isWorkspaceAdmin()
+                    );
+
+      allow list: if isSignedIn() &&
+                     (
+                       (request.auth.uid == ownerUid && isApprovedMember() && resource.data.ledgerOwnerUid == request.auth.uid) ||
+                       (isWorkspaceAdmin() && resource.data.workspaceAdminUid == request.auth.uid && resource.data.ledgerOwnerUid == ownerUid)
+                     );
+
+      allow create: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(entryId) &&
+                       isValidSaleEntry(incoming(), ownerUid) &&
+                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin()) &&
+                       exists(/databases/$(database)/documents/config/workspace) &&
+                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid;
+
+      allow update: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(entryId) &&
+                       isValidSaleEntry(incoming(), ownerUid) &&
+                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin()) &&
+                       incoming().ledgerOwnerUid == existing().ledgerOwnerUid &&
+                       incoming().workspaceAdminUid == existing().workspaceAdminUid &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         // Action 1: Toggle Paid/Unpaid status
+                         incoming().diff(existing()).affectedKeys().hasOnly(['isPaid', 'updatedAt']) ||
+                         // Action 2: Edit customer sale details
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'customerName', 'dataGb', 'priceToman', 'originalPresetPriceToman',
+                           'presetName', 'isPaid', 'isNewUser', 'bonusGb', 'note', 'updatedAt'
+                         ])
+                       );
+
+      allow delete: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(entryId) &&
+                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin());
+    }
+
+    // --- 5. Archived Ledger Cycles & Seller Sent Lists (DATA-01, DATA-03, SEC-01, SEC-05) ---
+    match /ledgers/{ownerUid}/archives/{archiveId} {
+      allow get: if isSignedIn() &&
+                    isValidId(ownerUid) &&
+                    isValidId(archiveId) &&
+                    (
+                      (request.auth.uid == ownerUid && isApprovedMember()) ||
+                      isWorkspaceAdmin()
+                    );
+
+      allow list: if isSignedIn() &&
+                     (
+                       (request.auth.uid == ownerUid && isApprovedMember() && resource.data.ledgerOwnerUid == request.auth.uid) ||
+                       (isWorkspaceAdmin() && resource.data.workspaceAdminUid == request.auth.uid && resource.data.ledgerOwnerUid == ownerUid)
+                     );
+
+      allow create: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(archiveId) &&
+                       isValidLedgerArchive(incoming(), ownerUid) &&
+                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin()) &&
+                       exists(/databases/$(database)/documents/config/workspace) &&
+                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid;
+
+      // Allow:
+      // 1) Updating 'submitted_current' pointer when Seller sends a new snapshot or resets cycle
+      // 2) Toggling Paid/Unpaid checkboxes inside a finalized archive WITHOUT mutating any financial totals, rates, or entry counts (DATA-01 / T05)
+      allow update: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(archiveId) &&
+                       isValidLedgerArchive(incoming(), ownerUid) &&
+                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin()) &&
+                       incoming().ledgerOwnerUid == existing().ledgerOwnerUid &&
+                       incoming().workspaceAdminUid == existing().workspaceAdminUid &&
+                       (
+                         archiveId == 'submitted_current' ||
+                         (
+                           incoming().items.size() == existing().items.size() &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['items', 'paidToman', 'unpaidToman', 'paidMap', 'updatedAt'])
+                         )
+                       );
+
+      allow delete: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(archiveId) &&
+                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin());
+    }
+
+    // --- 6. Custom GB & Toman Preset Packages (Admin-Editable, Approved-Member Readable) ---
+    match /ledgers/{ownerUid}/presets/{presetId} {
+      allow get: if isSignedIn() &&
+                    isValidId(ownerUid) &&
+                    isValidId(presetId) &&
+                    (isApprovedMember() || isWorkspaceAdmin());
+
+      allow list: if isSignedIn() &&
+                     (isApprovedMember() || isWorkspaceAdmin()) &&
+                     (
+                       (request.auth.uid == ownerUid && resource.data.ledgerOwnerUid == request.auth.uid) ||
+                       (resource.data.workspaceAdminUid == request.auth.uid && resource.data.ledgerOwnerUid == ownerUid) ||
+                       (resource.data.ledgerOwnerUid == resource.data.workspaceAdminUid && resource.data.ledgerOwnerUid == ownerUid)
+                     );
+
+      allow create: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(presetId) &&
+                       isValidDataPreset(incoming(), ownerUid) &&
+                       isWorkspaceAdmin() &&
+                       exists(/databases/$(database)/documents/config/workspace) &&
+                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid;
+
+      allow update: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(presetId) &&
+                       isValidDataPreset(incoming(), ownerUid) &&
+                       isWorkspaceAdmin() &&
+                       incoming().ledgerOwnerUid == existing().ledgerOwnerUid &&
+                       incoming().workspaceAdminUid == existing().workspaceAdminUid &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'label', 'dataGb', 'defaultPriceToman', 'newUserBonusGb', 'updatedAt'
+                       ]);
+
+      allow delete: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(presetId) &&
+                       isWorkspaceAdmin();
+    }
+  }
+}

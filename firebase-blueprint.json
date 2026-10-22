@@ -1,0 +1,352 @@
+{
+  "entities": {
+    "WorkspaceConfig": {
+      "title": "WorkspaceConfig",
+      "description": "Singleton workspace configuration storing the primary Admin UID, business identity, global cost per GB in Toman, and Admin/Seller profit split percentage.",
+      "type": "object",
+      "properties": {
+        "adminUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the primary workspace Admin."
+        },
+        "adminEmail": {
+          "type": "string",
+          "description": "Email address of the primary workspace Admin."
+        },
+        "businessName": {
+          "type": "string",
+          "description": "Display name of the VPN business workspace."
+        },
+        "costPerGbToman": {
+          "type": "integer",
+          "description": "Infrastructure cost per 1 GB of VPN data in Toman."
+        },
+        "adminProfitPercent": {
+          "type": "integer",
+          "description": "Admin share percentage of net profit (default 50, Seller share is 100 - adminProfitPercent)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": ["adminUid", "adminEmail", "businessName", "createdAt", "updatedAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile and RBAC role assignment for Admin and Seller accounts.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user."
+        },
+        "workspaceAdminUid": {
+          "type": "string",
+          "description": "Denormalized UID of the workspace Admin for zero-lookup rule evaluation."
+        },
+        "email": {
+          "type": "string",
+          "description": "Google account email address."
+        },
+        "emailKey": {
+          "type": "string",
+          "description": "Deterministic sanitized key derived from the lowercase email."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the Seller or Admin."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["ADMIN", "SELLER"],
+          "description": "Role within the VPN bookkeeping workspace."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["APPROVED", "PENDING", "REVOKED"],
+          "description": "Approval state controlled by the Admin."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": ["userId", "workspaceAdminUid", "email", "emailKey", "displayName", "role", "status", "createdAt", "updatedAt"]
+    },
+    "ApprovedEmail": {
+      "title": "ApprovedEmail",
+      "description": "Admin-managed roster of approved Seller Google email addresses.",
+      "type": "object",
+      "properties": {
+        "emailKey": {
+          "type": "string",
+          "description": "Sanitized identifier for the email."
+        },
+        "email": {
+          "type": "string",
+          "description": "Lowercase Google email address of the approved seller."
+        },
+        "sellerName": {
+          "type": "string",
+          "description": "Friendly display name assigned by the Admin."
+        },
+        "workspaceAdminUid": {
+          "type": "string",
+          "description": "UID of the Admin who approved the email."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["APPROVED", "REVOKED"],
+          "description": "Whether this email is currently authorized as a Seller."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": ["emailKey", "email", "sellerName", "workspaceAdminUid", "status", "createdAt", "updatedAt"]
+    },
+    "SaleEntry": {
+      "title": "SaleEntry",
+      "description": "Individual customer VPN data purchase record in an active ledger.",
+      "type": "object",
+      "properties": {
+        "ledgerOwnerUid": {
+          "type": "string",
+          "description": "UID of the ledger owner (Seller UID or Admin UID for private Admin book)."
+        },
+        "workspaceAdminUid": {
+          "type": "string",
+          "description": "Denormalized UID of the workspace Admin allowing Admin inspection without get() in list."
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Name or handle of the customer purchasing VPN data."
+        },
+        "dataGb": {
+          "type": "number",
+          "description": "Total allocated volume of VPN data in Gigabytes (GB), including any New User bonus GB."
+        },
+        "priceToman": {
+          "type": "integer",
+          "description": "Final sale price in Toman (after any manual override or discount)."
+        },
+        "originalPresetPriceToman": {
+          "type": "integer",
+          "description": "Original preset price in Toman before discount/override."
+        },
+        "presetName": {
+          "type": "string",
+          "description": "Label of the preset plan used, or Custom."
+        },
+        "isPaid": {
+          "type": "boolean",
+          "description": "True if the customer has paid; false if unpaid so far."
+        },
+        "isNewUser": {
+          "type": "boolean",
+          "description": "True if this customer is a new user receiving promotional bonus GB."
+        },
+        "bonusGb": {
+          "type": "number",
+          "description": "Extra promotional GB included in dataGb for a new user."
+        },
+        "note": {
+          "type": "string",
+          "description": "Optional note about the purchase or discount."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "ledgerOwnerUid",
+        "workspaceAdminUid",
+        "customerName",
+        "dataGb",
+        "priceToman",
+        "originalPresetPriceToman",
+        "presetName",
+        "isPaid",
+        "note",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "LedgerArchive": {
+      "title": "LedgerArchive",
+      "description": "Snapshot of a ledger created when resetting the active sales cycle or sending current list to Admin.",
+      "type": "object",
+      "properties": {
+        "ledgerOwnerUid": {
+          "type": "string",
+          "description": "UID of the ledger owner."
+        },
+        "workspaceAdminUid": {
+          "type": "string",
+          "description": "UID of the workspace Admin."
+        },
+        "ownerName": {
+          "type": "string",
+          "description": "Display name of the ledger owner at archive time."
+        },
+        "cycleTitle": {
+          "type": "string",
+          "description": "Label for the archived billing cycle."
+        },
+        "totalSalesToman": {
+          "type": "integer",
+          "description": "Sum of all sales in Toman in this archived cycle."
+        },
+        "paidToman": {
+          "type": "integer",
+          "description": "Sum of paid sales in Toman."
+        },
+        "unpaidToman": {
+          "type": "integer",
+          "description": "Sum of unpaid sales in Toman."
+        },
+        "totalGb": {
+          "type": "number",
+          "description": "Total gigabytes allocated in this cycle."
+        },
+        "costPerGbToman": {
+          "type": "integer",
+          "description": "Infrastructure cost per GB in Toman at snapshot time."
+        },
+        "adminProfitPercent": {
+          "type": "integer",
+          "description": "Admin profit split percentage at snapshot time."
+        },
+        "entryCount": {
+          "type": "integer",
+          "description": "Number of customer purchase records archived."
+        },
+        "items": {
+          "type": "array",
+          "description": "Bounded list of customer purchase maps archived in this snapshot."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "ledgerOwnerUid",
+        "workspaceAdminUid",
+        "ownerName",
+        "cycleTitle",
+        "totalSalesToman",
+        "paidToman",
+        "unpaidToman",
+        "totalGb",
+        "entryCount",
+        "items",
+        "createdAt"
+      ]
+    },
+    "DataPreset": {
+      "title": "DataPreset",
+      "description": "Quick-select VPN data volume (GB), New User bonus GB, and default Toman price package.",
+      "type": "object",
+      "properties": {
+        "ledgerOwnerUid": {
+          "type": "string",
+          "description": "UID of the ledger owner."
+        },
+        "workspaceAdminUid": {
+          "type": "string",
+          "description": "UID of the workspace Admin."
+        },
+        "label": {
+          "type": "string",
+          "description": "Package display label (e.g., 50 GB Pro)."
+        },
+        "dataGb": {
+          "type": "number",
+          "description": "Default data volume in GB."
+        },
+        "defaultPriceToman": {
+          "type": "integer",
+          "description": "Default price in Toman before any manual customer override."
+        },
+        "newUserBonusGb": {
+          "type": "number",
+          "description": "Extra promotional GB awarded to a new user purchasing this plan."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "ledgerOwnerUid",
+        "workspaceAdminUid",
+        "label",
+        "dataGb",
+        "defaultPriceToman",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/config/{configId}": {
+      "schema": "WorkspaceConfig",
+      "description": "Singleton workspace configuration at /config/workspace."
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profiles and approval statuses for Admin and Sellers."
+    },
+    "/approved_emails/{emailKey}": {
+      "schema": "ApprovedEmail",
+      "description": "Admin-approved Seller Google emails."
+    },
+    "/ledgers/{ownerUid}/entries/{entryId}": {
+      "schema": "SaleEntry",
+      "description": "Active VPN sale entries scoped to a Seller or the Admin private ledger."
+    },
+    "/ledgers/{ownerUid}/archives/{archiveId}": {
+      "schema": "LedgerArchive",
+      "description": "Archived ledger snapshots created during ledger resets or sent to Admin."
+    },
+    "/ledgers/{ownerUid}/presets/{presetId}": {
+      "schema": "DataPreset",
+      "description": "Custom quick-select GB, bonus GB, and Toman preset packages for a ledger."
+    }
+  }
+}

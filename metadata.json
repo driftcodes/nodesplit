@@ -1,0 +1,6 @@
+{
+  "name": "NodeSplit",
+  "description": "Multi-seller VPN bookkeeping, 3-way infrastructure & profit split calculator, and Toman sales ledger with graphical PDF export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
