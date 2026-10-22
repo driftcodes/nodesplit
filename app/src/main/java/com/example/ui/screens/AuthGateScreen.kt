@@ -288,7 +288,7 @@ fun PendingApprovalScreen(
                         text = if (isRevoked) {
                             "Your seller access for this NodeSplit workspace has been revoked by the Workspace Admin. Contact your administrator if you need access restored."
                         } else {
-                            "Your Google account is registered as a Seller and is waiting for the Workspace Admin to approve your email in the Admin & Split tab."
+                            "Your Google account is registered as a Seller and is waiting for the Workspace Admin to approve your email in Settings. Then tap \"Check approval status\"."
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

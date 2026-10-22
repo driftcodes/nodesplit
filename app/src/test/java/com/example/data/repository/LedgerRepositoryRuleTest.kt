@@ -1,6 +1,7 @@
 package com.example.data.repository
 
 import com.example.base.FirestoreEmulatorTestBase
+import com.example.data.model.LedgerArchive
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -15,8 +16,10 @@ class LedgerRepositoryRuleTest : FirestoreEmulatorTestBase() {
 
     @Test
     fun bootstrapWorkspace_addSale_togglePaid_andResetArchive_succeedsForAdminAndSeller() = runBlocking {
-        // 1. Admin initializes workspace
+        // 1. The owner has created config/workspace in the console; the admin signs in
+        clearEmulatorData()
         val adminUid = signInTestUser(ADMIN_EMAIL)
+        seedWorkspace(adminUid)
         val repo = LedgerRepository(firestore, auth)
 
         val bootstrapResult = withTimeout(DEFAULT_TIMEOUT_MS) {
@@ -138,21 +141,99 @@ class LedgerRepositoryRuleTest : FirestoreEmulatorTestBase() {
         assertEquals(60_000L, archiveMetrics.sellerProfitToman)
         assertEquals(150_000L, archiveMetrics.sellerPayableToAdminToman)
 
-        // 8. Seller A toggles Paid/Unpaid checkbox inside the archived snapshot
-        val updatedArchiveItems = createdArchive.parsedItems().map { it.copy(isPaid = false) }
+        // 8. Seller A ticks one payment checkbox inside the archive (narrow paidMap update)
+        val archivedItemId = createdArchive.parsedItems().single().itemId
         val archiveToggleResult = withTimeout(DEFAULT_TIMEOUT_MS) {
-            repo.updateArchiveItemsPaidStatus(
+            repo.updateSnapshotItemPaidStatus(
                 ledgerOwnerUid = sellerAUid,
-                archiveId = archiveId!!,
-                updatedItems = updatedArchiveItems
+                collection = LedgerArchive.COLLECTION_ARCHIVES,
+                snapshotId = archiveId!!,
+                itemId = archivedItemId,
+                isPaid = false
             )
         }
-        assertTrue("Updating archive item paid status should succeed", archiveToggleResult.isSuccess)
+        assertTrue("Updating one archive checkbox should succeed", archiveToggleResult.isSuccess)
+
+        // 9. The archive can be voided with a reason, never deleted
+        val voidResult = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repo.voidArchive(sellerAUid, archiveId!!, "Entered twice")
+        }
+        assertTrue("Voiding the archive should succeed", voidResult.isSuccess)
+    }
+
+    @Test
+    fun sendReport_createsImmutableHistory_andNewCycleClearsCurrentReport() = runBlocking {
+        clearEmulatorData()
+        val adminUid = signInTestUser(ADMIN_EMAIL)
+        seedWorkspace(adminUid)
+        val repo = LedgerRepository(firestore, auth)
+        withTimeout(DEFAULT_TIMEOUT_MS) { repo.getOrBootstrapWorkspaceAndProfile(adminUid, ADMIN_EMAIL, "Admin") }
+        withTimeout(DEFAULT_TIMEOUT_MS) { repo.addOrApproveSellerEmail(adminUid, SELLER_A_EMAIL, "Seller Alpha") }
+
+        val sellerUid = signInTestUser(SELLER_A_EMAIL)
+        withTimeout(DEFAULT_TIMEOUT_MS) { repo.getOrBootstrapWorkspaceAndProfile(sellerUid, SELLER_A_EMAIL, "Seller Alpha") }
+        val saleId = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repo.addSaleEntry(sellerUid, adminUid, "Sara", 25.0, 135_000L, 135_000L, "25 GB Standard", false, "")
+        }.getOrThrow()
+        val entries = withTimeout(FLOW_TIMEOUT_MS) {
+            repo.observeLedgerEntries(sellerUid, adminUid).first { list -> list.any { it.id == saleId } }
+        }
+
+        val first = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repo.submitCurrentListToAdmin(sellerUid, adminUid, "Seller Alpha", entries, 1_000L, 50, submissionId = "sub_test_1")
+        }
+        assertTrue(first.isSuccess)
+        val second = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repo.submitCurrentListToAdmin(sellerUid, adminUid, "Seller Alpha", entries, 2_000L, 50, submissionId = "sub_test_2")
+        }
+        assertTrue(second.isSuccess)
+
+        val history = withTimeout(FLOW_TIMEOUT_MS) {
+            repo.observeSubmissionHistory(sellerUid, adminUid).first { it.size >= 2 }
+        }
+        assertEquals(setOf("sub_test_1", "sub_test_2"), history.map { it.id }.toSet())
+        // Each report keeps the rate it was sent with.
+        assertEquals(25_000L, history.first { it.id == "sub_test_1" }.computeMetrics().infraCostToman)
+        assertEquals(50_000L, history.first { it.id == "sub_test_2" }.computeMetrics().infraCostToman)
+
+        val latest = withTimeout(FLOW_TIMEOUT_MS) {
+            repo.observeLatestSubmission(sellerUid, adminUid).first { it?.id == "sub_test_2" }
+        }
+        assertNotNull(latest)
+
+        // Re-sending under an existing id is refused: reports are immutable.
+        val overwrite = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repo.submitCurrentListToAdmin(sellerUid, adminUid, "Seller Alpha", emptyList(), 0L, 50, submissionId = "sub_test_1")
+        }
+        assertTrue(overwrite.isFailure)
+
+        // A new cycle clears the current-report pointer but keeps the history.
+        val reset = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repo.resetAndArchiveLedger(sellerUid, adminUid, "Seller Alpha", "Cycle 1", entries, keepArchive = true)
+        }
+        assertTrue(reset.isSuccess)
+        val afterReset = withTimeout(FLOW_TIMEOUT_MS) {
+            repo.observeLatestSubmission(sellerUid, adminUid).first { it == null }
+        }
+        assertEquals(null, afterReset)
+    }
+
+    @Test
+    fun bootstrap_withoutWorkspace_reportsNotConfigured_andCannotCreateIt() = runBlocking {
+        clearEmulatorData()
+        val strangerUid = signInTestUser("stranger@veloledger.test")
+        val repo = LedgerRepository(firestore, auth)
+        val result = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repo.getOrBootstrapWorkspaceAndProfile(strangerUid, "stranger@veloledger.test", "Stranger")
+        }
+        assertTrue(result.exceptionOrNull() is WorkspaceNotConfiguredException)
     }
 
     @Test
     fun crossUserAndAdminPrivateLedgerIsolation_sellerCannotReadAdminOrOtherSellerLedger() = runBlocking {
+        clearEmulatorData()
         val adminUid = signInTestUser(ADMIN_EMAIL)
+        seedWorkspace(adminUid)
         val repo = LedgerRepository(firestore, auth)
         withTimeout(DEFAULT_TIMEOUT_MS) {
             repo.getOrBootstrapWorkspaceAndProfile(adminUid, ADMIN_EMAIL, "Admin")
@@ -208,7 +289,9 @@ class LedgerRepositoryRuleTest : FirestoreEmulatorTestBase() {
 
     @Test
     fun unauthenticatedCaller_cannotQueryLedgerEntries() = runBlocking {
+        clearEmulatorData()
         val adminUid = signInTestUser(ADMIN_EMAIL)
+        seedWorkspace(adminUid)
         val repo = LedgerRepository(firestore, auth)
         withTimeout(DEFAULT_TIMEOUT_MS) {
             repo.getOrBootstrapWorkspaceAndProfile(adminUid, ADMIN_EMAIL, "Admin")

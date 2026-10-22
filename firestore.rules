@@ -25,14 +25,29 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    // Invitations are keyed by the canonical (trimmed, lower-case) email address itself.
+    function isValidEmailKey(key) {
+      return key is string && key.size() >= 3 && key.size() <= 200 &&
+             key.matches('^[a-z0-9._%+\\-]+@[a-z0-9.\\-]+$');
+    }
+
+    // Legacy invitation keys (a_at_b_dot_c) are still readable/migratable by the Admin.
+    function isValidInvitationKey(key) {
+      return isValidId(key) || isValidEmailKey(key);
+    }
+
     function isFiniteNumber(n) {
       return (n is int || n is float) && n == n;
+    }
+
+    function workspaceAdminUid() {
+      return get(/databases/$(database)/documents/config/workspace).data.adminUid;
     }
 
     function isWorkspaceAdmin() {
       return isSignedIn() &&
              exists(/databases/$(database)/documents/config/workspace) &&
-             get(/databases/$(database)/documents/config/workspace).data.adminUid == request.auth.uid;
+             workspaceAdminUid() == request.auth.uid;
     }
 
     // SEC-01: Require an existing, explicitly APPROVED UserProfile in the active workspace
@@ -41,14 +56,45 @@ service cloud.firestore {
              exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'APPROVED' &&
              exists(/databases/$(database)/documents/config/workspace) &&
-             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.workspaceAdminUid ==
-               get(/databases/$(database)/documents/config/workspace).data.adminUid;
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.workspaceAdminUid == workspaceAdminUid();
     }
 
-    function matchesTokenEmailIfPresent(emailField) {
-      return !('email' in request.auth.token) ||
-             request.auth.token.email == null ||
-             emailField == request.auth.token.email.lower();
+    function isApprovedOwner(ownerUid) {
+      return request.auth.uid == ownerUid && isApprovedMember();
+    }
+
+    // SEC-02: Identity binding to the signed-in token, never to a client-supplied email.
+    function hasTokenEmail() {
+      return isSignedIn() &&
+             ('email' in request.auth.token) &&
+             request.auth.token.email is string &&
+             request.auth.token.email.size() >= 3;
+    }
+
+    function emailMatchesToken(email) {
+      return hasTokenEmail() && email is string && email == request.auth.token.email.lower();
+    }
+
+    function hasVerifiedTokenEmail() {
+      return hasTokenEmail() &&
+             ('email_verified' in request.auth.token) &&
+             request.auth.token.email_verified == true;
+    }
+
+    function isApprovedInvitation(key, email, adminUid) {
+      return isValidInvitationKey(key) &&
+             exists(/databases/$(database)/documents/approved_emails/$(key)) &&
+             get(/databases/$(database)/documents/approved_emails/$(key)).data.email == email &&
+             get(/databases/$(database)/documents/approved_emails/$(key)).data.workspaceAdminUid == adminUid &&
+             get(/databases/$(database)/documents/approved_emails/$(key)).data.status == 'APPROVED';
+    }
+
+    // A self-service approval must come from a verified token whose email owns an APPROVED invitation.
+    function canSelfApprove(data) {
+      return emailMatchesToken(data.email) &&
+             hasVerifiedTokenEmail() &&
+             (isApprovedInvitation(data.email, data.email, data.workspaceAdminUid) ||
+              isApprovedInvitation(data.emailKey, data.email, data.workspaceAdminUid));
     }
 
     function isValidArchiveItemMap(item) {
@@ -86,7 +132,7 @@ service cloud.firestore {
              data.userId is string && data.userId == userId && isValidId(data.userId) &&
              isValidId(data.workspaceAdminUid) &&
              data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
-             isValidId(data.emailKey) &&
+             isValidInvitationKey(data.emailKey) &&
              data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
              data.role is string && (data.role == 'ADMIN' || data.role == 'SELLER') &&
              data.status is string && (data.status == 'APPROVED' || data.status == 'PENDING' || data.status == 'REVOKED') &&
@@ -97,7 +143,7 @@ service cloud.firestore {
     function isValidApprovedEmail(data, emailKey) {
       return data.keys().hasAll(['emailKey', 'email', 'sellerName', 'workspaceAdminUid', 'status', 'createdAt', 'updatedAt']) &&
              data.keys().hasOnly(['emailKey', 'email', 'sellerName', 'workspaceAdminUid', 'status', 'createdAt', 'updatedAt']) &&
-             data.emailKey is string && data.emailKey == emailKey && isValidId(data.emailKey) &&
+             data.emailKey is string && data.emailKey == emailKey && isValidInvitationKey(data.emailKey) &&
              data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
              data.sellerName is string && data.sellerName.size() >= 1 && data.sellerName.size() <= 100 &&
              isValidId(data.workspaceAdminUid) &&
@@ -133,7 +179,10 @@ service cloud.firestore {
              data.updatedAt is timestamp && data.updatedAt <= request.time;
     }
 
-    function isValidLedgerArchive(data, ownerUid) {
+    // Shared shape of a frozen snapshot (closed cycle archive or a sent report).
+    // Firestore rules cannot iterate a list, so only the first/last items are inspected here;
+    // the app re-derives every total from the items and flags mismatches (SEC-05).
+    function isValidSnapshot(data, ownerUid) {
       return data.keys().hasAll([
                'ledgerOwnerUid', 'workspaceAdminUid', 'ownerName', 'cycleTitle',
                'totalSalesToman', 'paidToman', 'unpaidToman', 'totalGb',
@@ -144,7 +193,9 @@ service cloud.firestore {
                'totalSalesToman', 'paidToman', 'unpaidToman', 'totalGb',
                'costPerGbToman', 'adminProfitPercent', 'settingsRevision',
                'paidMap', 'submissionRevision', 'supersededByReset', 'updatedAt',
-               'entryCount', 'items', 'createdAt'
+               'entryCount', 'items', 'createdAt', 'schemaVersion', 'clientCreatedAtMillis',
+               'voided', 'voidReason', 'voidedBy', 'voidedAt',
+               'adminStatus', 'adminStatusUpdatedAt'
              ]) &&
              data.ledgerOwnerUid is string && data.ledgerOwnerUid == ownerUid && isValidId(data.ledgerOwnerUid) &&
              isValidId(data.workspaceAdminUid) &&
@@ -158,9 +209,11 @@ service cloud.firestore {
              (!('costPerGbToman' in data) || (data.costPerGbToman is int && data.costPerGbToman >= 0 && data.costPerGbToman <= 1000000000)) &&
              (!('adminProfitPercent' in data) || (data.adminProfitPercent is int && data.adminProfitPercent >= 0 && data.adminProfitPercent <= 100)) &&
              (!('settingsRevision' in data) || (data.settingsRevision is int && data.settingsRevision >= 1)) &&
-             (!('paidMap' in data) || data.paidMap is map) &&
+             (!('paidMap' in data) || (data.paidMap is map && data.paidMap.size() <= data.entryCount)) &&
              (!('submissionRevision' in data) || (data.submissionRevision is int && data.submissionRevision >= 1)) &&
              (!('supersededByReset' in data) || data.supersededByReset is bool) &&
+             (!('schemaVersion' in data) || (data.schemaVersion is int && data.schemaVersion >= 1)) &&
+             (!('clientCreatedAtMillis' in data) || (data.clientCreatedAtMillis is int && data.clientCreatedAtMillis >= 0)) &&
              (!('updatedAt' in data) || (data.updatedAt is timestamp && data.updatedAt <= request.time)) &&
              data.entryCount is int && data.entryCount >= 0 && data.entryCount <= 500 &&
              data.items is list && data.items.size() == data.entryCount && data.items.size() <= 500 &&
@@ -169,6 +222,17 @@ service cloud.firestore {
                isValidArchiveItemMap(data.items[data.items.size() - 1])
              )) &&
              data.createdAt is timestamp && data.createdAt <= request.time;
+    }
+
+    function hasNoVoidOrAdminFields(data) {
+      return !('voided' in data) && !('voidReason' in data) && !('voidedBy' in data) && !('voidedAt' in data) &&
+             !('adminStatus' in data) && !('adminStatusUpdatedAt' in data);
+    }
+
+    // DATA-03: A checkbox changes one paidMap entry; items, totals and rates stay frozen.
+    function isPaidMapOnlyUpdate() {
+      return incoming().diff(existing()).affectedKeys().hasOnly(['paidMap', 'updatedAt']) &&
+             incoming().paidMap is map;
     }
 
     function isValidDataPreset(data, ownerUid) {
@@ -195,11 +259,9 @@ service cloud.firestore {
       allow get: if isSignedIn() && configId == 'workspace';
       allow list: if false;
 
-      allow create: if isSignedIn() &&
-                       configId == 'workspace' &&
-                       isValidWorkspaceConfig(incoming()) &&
-                       incoming().adminUid == request.auth.uid &&
-                       !exists(/databases/$(database)/documents/config/workspace);
+      // SEC-04: No client may bootstrap the workspace. The owner creates config/workspace once
+      // in the Firebase console (see README "First-time setup"), so a stranger cannot seize it.
+      allow create: if false;
 
       allow update: if isSignedIn() &&
                        configId == 'workspace' &&
@@ -230,27 +292,23 @@ service cloud.firestore {
                        isValidId(userId) &&
                        isValidUserProfile(incoming(), userId) &&
                        exists(/databases/$(database)/documents/config/workspace) &&
-                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid &&
+                       incoming().workspaceAdminUid == workspaceAdminUid() &&
                        (
                          // Case A: Workspace Admin creating own ADMIN profile or a Seller profile
                          (isWorkspaceAdmin() && (
                            (request.auth.uid == userId && incoming().role == 'ADMIN' && incoming().status == 'APPROVED') ||
                            (incoming().role == 'SELLER')
                          )) ||
-                         // Case B: Seller registering own PENDING profile (bound to verified token email if present)
+                         // Case B: Seller registering own PENDING profile, bound to the signed-in token email
                          (request.auth.uid == userId &&
                           incoming().role == 'SELLER' &&
                           incoming().status == 'PENDING' &&
-                          matchesTokenEmailIfPresent(incoming().email)) ||
-                         // Case C: Seller registering own APPROVED profile backed by pre-approved email record
+                          emailMatchesToken(incoming().email)) ||
+                         // Case C: Seller registering own APPROVED profile backed by an invitation for the verified token email
                          (request.auth.uid == userId &&
                           incoming().role == 'SELLER' &&
                           incoming().status == 'APPROVED' &&
-                          matchesTokenEmailIfPresent(incoming().email) &&
-                          exists(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)) &&
-                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.email == incoming().email &&
-                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.workspaceAdminUid == incoming().workspaceAdminUid &&
-                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.status == 'APPROVED')
+                          canSelfApprove(incoming()))
                        );
 
       allow update: if isSignedIn() &&
@@ -259,7 +317,6 @@ service cloud.firestore {
                        incoming().userId == existing().userId &&
                        incoming().workspaceAdminUid == existing().workspaceAdminUid &&
                        incoming().email == existing().email &&
-                       incoming().emailKey == existing().emailKey &&
                        incoming().createdAt == existing().createdAt &&
                        (
                          // Action 1: Admin updates seller approval status or display name
@@ -271,44 +328,44 @@ service cloud.firestore {
                           incoming().role == existing().role &&
                           incoming().status == existing().status &&
                           incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])) ||
-                         // Action 3: Seller upgrades strictly from PENDING to APPROVED via approved_emails proof (SEC-03: REVOKED cannot self-reverse)
+                         // Action 3: Seller upgrades strictly from PENDING to APPROVED via an invitation for the
+                         // verified token email (SEC-03: REVOKED can never self-reverse). The emailKey may move
+                         // from a legacy key to the canonical email key in the same write.
                          (request.auth.uid == userId &&
                           existing().role == 'SELLER' &&
                           existing().status == 'PENDING' &&
                           incoming().role == 'SELLER' &&
                           incoming().status == 'APPROVED' &&
-                          matchesTokenEmailIfPresent(incoming().email) &&
-                          exists(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)) &&
-                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.email == incoming().email &&
-                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.workspaceAdminUid == incoming().workspaceAdminUid &&
-                          get(/databases/$(database)/documents/approved_emails/$(incoming().emailKey)).data.status == 'APPROVED' &&
-                          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'displayName', 'updatedAt']))
+                          canSelfApprove(incoming()) &&
+                          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'displayName', 'emailKey', 'updatedAt']))
                        );
 
       allow delete: if isSignedIn() && isValidId(userId) && isWorkspaceAdmin();
     }
 
-    // --- 3. Admin-Approved Seller Emails (SEC-02: Scoped to Admin or matching claimant email) ---
+    // --- 3. Admin-Approved Seller Emails (SEC-02: Admin, or the token email's own invitation only) ---
     match /approved_emails/{emailKey} {
+      // A non-admin may only read the invitation keyed by their own token email (missing or not),
+      // or a legacy-keyed invitation whose stored email is theirs. Probing someone else's key is
+      // denied whether or not it exists, so existence never leaks.
       allow get: if isSignedIn() &&
-                    isValidId(emailKey) &&
+                    isValidInvitationKey(emailKey) &&
                     (isWorkspaceAdmin() ||
-                     resource == null ||
-                     matchesTokenEmailIfPresent(resource.data.email));
+                     (hasTokenEmail() && emailKey == request.auth.token.email.lower()) ||
+                     (resource != null && emailMatchesToken(resource.data.email)));
 
       allow list: if isSignedIn() &&
                      isWorkspaceAdmin() &&
                      resource.data.workspaceAdminUid == request.auth.uid;
 
       allow create: if isSignedIn() &&
-                       isValidId(emailKey) &&
+                       isValidInvitationKey(emailKey) &&
                        isValidApprovedEmail(incoming(), emailKey) &&
                        isWorkspaceAdmin() &&
-                       exists(/databases/$(database)/documents/config/workspace) &&
-                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid;
+                       incoming().workspaceAdminUid == workspaceAdminUid();
 
       allow update: if isSignedIn() &&
-                       isValidId(emailKey) &&
+                       isValidInvitationKey(emailKey) &&
                        isValidApprovedEmail(incoming(), emailKey) &&
                        isWorkspaceAdmin() &&
                        incoming().emailKey == existing().emailKey &&
@@ -317,7 +374,7 @@ service cloud.firestore {
                        incoming().createdAt == existing().createdAt &&
                        incoming().diff(existing()).affectedKeys().hasOnly(['sellerName', 'status', 'updatedAt']);
 
-      allow delete: if isSignedIn() && isValidId(emailKey) && isWorkspaceAdmin();
+      allow delete: if isSignedIn() && isValidInvitationKey(emailKey) && isWorkspaceAdmin();
     }
 
     // --- 4. Active Ledger Entries (SEC-01: Strictly Approved Members or Workspace Admin) ---
@@ -325,14 +382,11 @@ service cloud.firestore {
       allow get: if isSignedIn() &&
                     isValidId(ownerUid) &&
                     isValidId(entryId) &&
-                    (
-                      (request.auth.uid == ownerUid && isApprovedMember()) ||
-                      isWorkspaceAdmin()
-                    );
+                    (isApprovedOwner(ownerUid) || isWorkspaceAdmin());
 
       allow list: if isSignedIn() &&
                      (
-                       (request.auth.uid == ownerUid && isApprovedMember() && resource.data.ledgerOwnerUid == request.auth.uid) ||
+                       (isApprovedOwner(ownerUid) && resource.data.ledgerOwnerUid == request.auth.uid) ||
                        (isWorkspaceAdmin() && resource.data.workspaceAdminUid == request.auth.uid && resource.data.ledgerOwnerUid == ownerUid)
                      );
 
@@ -340,83 +394,147 @@ service cloud.firestore {
                        isValidId(ownerUid) &&
                        isValidId(entryId) &&
                        isValidSaleEntry(incoming(), ownerUid) &&
-                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin()) &&
+                       (isApprovedOwner(ownerUid) || isWorkspaceAdmin()) &&
                        exists(/databases/$(database)/documents/config/workspace) &&
-                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid;
+                       incoming().workspaceAdminUid == workspaceAdminUid();
 
+      // Working sales stay editable: every "Send" freezes a new immutable report (see submissions).
       allow update: if isSignedIn() &&
                        isValidId(ownerUid) &&
                        isValidId(entryId) &&
                        isValidSaleEntry(incoming(), ownerUid) &&
-                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin()) &&
+                       (isApprovedOwner(ownerUid) || isWorkspaceAdmin()) &&
                        incoming().ledgerOwnerUid == existing().ledgerOwnerUid &&
                        incoming().workspaceAdminUid == existing().workspaceAdminUid &&
                        incoming().createdAt == existing().createdAt &&
-                       (
-                         // Action 1: Toggle Paid/Unpaid status
-                         incoming().diff(existing()).affectedKeys().hasOnly(['isPaid', 'updatedAt']) ||
-                         // Action 2: Edit customer sale details
-                         incoming().diff(existing()).affectedKeys().hasOnly([
-                           'customerName', 'dataGb', 'priceToman', 'originalPresetPriceToman',
-                           'presetName', 'isPaid', 'isNewUser', 'bonusGb', 'note', 'updatedAt'
-                         ])
-                       );
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'customerName', 'dataGb', 'priceToman', 'originalPresetPriceToman',
+                         'presetName', 'isPaid', 'isNewUser', 'bonusGb', 'note', 'updatedAt'
+                       ]);
 
       allow delete: if isSignedIn() &&
                        isValidId(ownerUid) &&
                        isValidId(entryId) &&
-                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin());
+                       (isApprovedOwner(ownerUid) || isWorkspaceAdmin());
     }
 
-    // --- 5. Archived Ledger Cycles & Seller Sent Lists (DATA-01, DATA-03, SEC-01, SEC-05) ---
+    // --- 5. Closed-Cycle Archives (DATA-01, DATA-03, SEC-01, SEC-05) ---
+    // 'submitted_current' is the legacy overwrite-only report document. It stays readable so old
+    // reports remain visible, but nobody can write it any more: reports now live in /submissions.
     match /ledgers/{ownerUid}/archives/{archiveId} {
       allow get: if isSignedIn() &&
                     isValidId(ownerUid) &&
                     isValidId(archiveId) &&
-                    (
-                      (request.auth.uid == ownerUid && isApprovedMember()) ||
-                      isWorkspaceAdmin()
-                    );
+                    (isApprovedOwner(ownerUid) || isWorkspaceAdmin());
 
       allow list: if isSignedIn() &&
                      (
-                       (request.auth.uid == ownerUid && isApprovedMember() && resource.data.ledgerOwnerUid == request.auth.uid) ||
+                       (isApprovedOwner(ownerUid) && resource.data.ledgerOwnerUid == request.auth.uid) ||
                        (isWorkspaceAdmin() && resource.data.workspaceAdminUid == request.auth.uid && resource.data.ledgerOwnerUid == ownerUid)
                      );
 
       allow create: if isSignedIn() &&
                        isValidId(ownerUid) &&
                        isValidId(archiveId) &&
-                       isValidLedgerArchive(incoming(), ownerUid) &&
-                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin()) &&
+                       archiveId != 'submitted_current' &&
+                       isValidSnapshot(incoming(), ownerUid) &&
+                       hasNoVoidOrAdminFields(incoming()) &&
+                       (isApprovedOwner(ownerUid) || isWorkspaceAdmin()) &&
                        exists(/databases/$(database)/documents/config/workspace) &&
-                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid;
+                       incoming().workspaceAdminUid == workspaceAdminUid();
 
-      // Allow:
-      // 1) Updating 'submitted_current' pointer when Seller sends a new snapshot or resets cycle
-      // 2) Toggling Paid/Unpaid checkboxes inside a finalized archive WITHOUT mutating any financial totals, rates, or entry counts (DATA-01 / T05)
+      // Allowed edits on a frozen archive:
+      // 1) one paidMap entry (customer payment checkbox) — items, totals, rates and counts never change;
+      // 2) a one-way "void" with a reason, author and server time — the record itself is kept.
       allow update: if isSignedIn() &&
                        isValidId(ownerUid) &&
                        isValidId(archiveId) &&
-                       isValidLedgerArchive(incoming(), ownerUid) &&
-                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin()) &&
-                       incoming().ledgerOwnerUid == existing().ledgerOwnerUid &&
-                       incoming().workspaceAdminUid == existing().workspaceAdminUid &&
+                       archiveId != 'submitted_current' &&
+                       isValidSnapshot(incoming(), ownerUid) &&
+                       (isApprovedOwner(ownerUid) || isWorkspaceAdmin()) &&
+                       existing().get('voided', false) == false &&
                        (
-                         archiveId == 'submitted_current' ||
+                         isPaidMapOnlyUpdate() ||
                          (
-                           incoming().items.size() == existing().items.size() &&
-                           incoming().diff(existing()).affectedKeys().hasOnly(['items', 'paidToman', 'unpaidToman', 'paidMap', 'updatedAt'])
+                           incoming().diff(existing()).affectedKeys().hasOnly(['voided', 'voidReason', 'voidedBy', 'voidedAt', 'updatedAt']) &&
+                           incoming().voided == true &&
+                           incoming().voidReason is string && incoming().voidReason.size() >= 3 && incoming().voidReason.size() <= 300 &&
+                           incoming().voidedBy == request.auth.uid &&
+                           incoming().voidedAt == request.time
                          )
                        );
 
-      allow delete: if isSignedIn() &&
-                       isValidId(ownerUid) &&
-                       isValidId(archiveId) &&
-                       ((request.auth.uid == ownerUid && isApprovedMember()) || isWorkspaceAdmin());
+      // Settlement evidence is never hard-deleted from the app (void it instead).
+      allow delete: if false;
     }
 
-    // --- 6. Custom GB & Toman Preset Packages (Admin-Editable, Approved-Member Readable) ---
+    // --- 6. Sent Reports: immutable, uniquely identified snapshots (DATA-01 / OFF-04) ---
+    match /ledgers/{ownerUid}/submissions/{submissionId} {
+      allow get: if isSignedIn() &&
+                    isValidId(ownerUid) &&
+                    isValidId(submissionId) &&
+                    (isApprovedOwner(ownerUid) || isWorkspaceAdmin());
+
+      allow list: if isSignedIn() &&
+                     (
+                       (isApprovedOwner(ownerUid) && resource.data.ledgerOwnerUid == request.auth.uid) ||
+                       (isWorkspaceAdmin() && resource.data.workspaceAdminUid == request.auth.uid && resource.data.ledgerOwnerUid == ownerUid)
+                     );
+
+      // Only the ledger owner sends reports. The receipt time is the server's, not the phone's.
+      allow create: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(submissionId) &&
+                       isApprovedOwner(ownerUid) &&
+                       isValidSnapshot(incoming(), ownerUid) &&
+                       hasNoVoidOrAdminFields(incoming()) &&
+                       incoming().createdAt == request.time &&
+                       exists(/databases/$(database)/documents/config/workspace) &&
+                       incoming().workspaceAdminUid == workspaceAdminUid();
+
+      allow update: if isSignedIn() &&
+                       isValidId(ownerUid) &&
+                       isValidId(submissionId) &&
+                       isValidSnapshot(incoming(), ownerUid) &&
+                       (
+                         ((isApprovedOwner(ownerUid) || isWorkspaceAdmin()) && isPaidMapOnlyUpdate()) ||
+                         // Admin records that a report was settled (or reopens it). Delivery is not settlement.
+                         (isWorkspaceAdmin() &&
+                          incoming().diff(existing()).affectedKeys().hasOnly(['adminStatus', 'adminStatusUpdatedAt', 'updatedAt']) &&
+                          (incoming().adminStatus == 'SETTLED' || incoming().adminStatus == 'RECEIVED') &&
+                          incoming().adminStatusUpdatedAt == request.time)
+                       );
+
+      allow delete: if false;
+    }
+
+    // Pointer to the owner's latest sent report ('' after a new cycle starts).
+    match /ledgers/{ownerUid}/pointers/{pointerId} {
+      allow get: if isSignedIn() &&
+                    isValidId(ownerUid) &&
+                    pointerId == 'latest_submission' &&
+                    (isApprovedOwner(ownerUid) || isWorkspaceAdmin());
+
+      allow list: if false;
+
+      allow create, update: if isSignedIn() &&
+                               isValidId(ownerUid) &&
+                               pointerId == 'latest_submission' &&
+                               isApprovedOwner(ownerUid) &&
+                               incoming().keys().hasAll(['ledgerOwnerUid', 'workspaceAdminUid', 'submissionId', 'updatedAt']) &&
+                               incoming().keys().hasOnly(['ledgerOwnerUid', 'workspaceAdminUid', 'submissionId', 'updatedAt']) &&
+                               incoming().ledgerOwnerUid == ownerUid &&
+                               incoming().workspaceAdminUid == workspaceAdminUid() &&
+                               incoming().submissionId is string &&
+                               (incoming().submissionId == '' ||
+                                (isValidId(incoming().submissionId) &&
+                                 existsAfter(/databases/$(database)/documents/ledgers/$(ownerUid)/submissions/$(incoming().submissionId)))) &&
+                               incoming().updatedAt == request.time;
+
+      allow delete: if false;
+    }
+
+    // --- 7. Custom GB & Toman Preset Packages (Admin-Editable, Approved-Member Readable) ---
     match /ledgers/{ownerUid}/presets/{presetId} {
       allow get: if isSignedIn() &&
                     isValidId(ownerUid) &&
@@ -436,8 +554,7 @@ service cloud.firestore {
                        isValidId(presetId) &&
                        isValidDataPreset(incoming(), ownerUid) &&
                        isWorkspaceAdmin() &&
-                       exists(/databases/$(database)/documents/config/workspace) &&
-                       incoming().workspaceAdminUid == get(/databases/$(database)/documents/config/workspace).data.adminUid;
+                       incoming().workspaceAdminUid == workspaceAdminUid();
 
       allow update: if isSignedIn() &&
                        isValidId(ownerUid) &&
