@@ -16,6 +16,8 @@ Android app for multi-seller VPN bookkeeping: bandwidth allocation, a three-way 
 
 ## First-time setup
 
+Step-by-step instructions with screenshots-level detail (Firebase console, project files, Android Studio, signing, release) are in [`docs/SETUP_GUIDE.md`](docs/SETUP_GUIDE.md). Short version:
+
 1. Create a Firebase project with **Google** sign-in and Firestore enabled.
 2. Put your `google-services.json` in `app/` (see `app/google-services.json.example`), and register the SHA-1/SHA-256 fingerprints of the key you sign with.
 3. Copy `app/src/main/res/values/firebase_applet_config.xml.example` to `firebase_applet_config.xml` and set your Firestore database ID.
